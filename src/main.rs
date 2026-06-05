@@ -1,15 +1,17 @@
-//! prism-bar host: a wlr-layer-shell surface driven by the damascene
+//! prism-bar host: wlr-layer-shell surfaces driven by the damascene
 //! wgpu `Runner` (the custom-host path — `damascene-winit-wgpu` only
-//! creates regular toplevels, so we own the surface and event loop).
+//! creates regular toplevels, so we own the surfaces and event loop).
 //!
-//! Shape of the loop:
+//! Shape:
 //!
-//!   SCTK layer surface (Top, anchored, exclusive zone)
-//!     → wgpu Surface via raw wayland handles
-//!     → per frame: app.build() → runner.prepare() → runner.render()
+//!   one Bar (wayland conn, protocol state, shared wgpu device, config)
+//!     → one BarSurface per configured output (SCTK output hotplug)
+//!       → layer surface + wgpu swapchain + damascene Runner + BarApp
+//!   per frame: app.build() → runner.prepare() → runner.render()
 //!   calloop: wayland socket + redraw deadlines (animation, clock)
-//!   SCTK pointer events → runner.pointer_*() → app.on_event()
+//!   SCTK pointer events → routed by wl_surface → runner.pointer_*()
 
+mod config;
 mod toplevels;
 mod ui;
 mod workspaces;
@@ -46,13 +48,11 @@ use damascene_core::prelude::{App, Rect};
 use damascene_core::BuildCx;
 use damascene_wgpu::{MsaaTarget, Runner, RunnerCaps};
 
+use crate::config::{Config, Position};
 use crate::toplevels::ToplevelsState;
 use crate::ui::BarApp;
 use crate::workspaces::WorkspacesState;
 
-/// Bar height / floating margin in logical pixels. Will come from config.
-const BAR_HEIGHT: u32 = 40;
-const BAR_MARGIN: i32 = 6;
 const MSAA_SAMPLES: u32 = 4;
 
 fn main() -> Result<()> {
@@ -63,48 +63,28 @@ fn main() -> Result<()> {
         )
         .init();
 
+    let config = Config::load()?;
+
     let conn = Connection::connect_to_env().context("connect to wayland")?;
     let (globals, event_queue) = registry_queue_init::<Bar>(&conn).context("registry init")?;
     let qh = event_queue.handle();
-
-    let compositor = CompositorState::bind(&globals, &qh).context("wl_compositor")?;
-    let layer_shell = LayerShell::bind(&globals, &qh).context("zwlr_layer_shell_v1")?;
-
-    // Layer surface: top layer, anchored to the top edge spanning the
-    // full output width, reserving its height so tiled windows don't
-    // overlap. Compositor picks the output (None) for the spike;
-    // per-output bars come with config.
-    let surface = compositor.create_surface(&qh);
-    let layer =
-        layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some("prism-bar"), None);
-    layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-    layer.set_size(0, BAR_HEIGHT);
-    // Floating look: margins pull the surface off the screen edges; the
-    // compositor adds the anchored-edge margin to the exclusive zone.
-    layer.set_margin(BAR_MARGIN, BAR_MARGIN, 0, BAR_MARGIN);
-    layer.set_exclusive_zone(BAR_HEIGHT as i32);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-    layer.commit();
 
     let mut bar = Bar {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
         seat_state: SeatState::new(&globals, &qh),
+        compositor: CompositorState::bind(&globals, &qh).context("wl_compositor")?,
+        layer_shell: LayerShell::bind(&globals, &qh).context("zwlr_layer_shell_v1")?,
         workspaces: WorkspacesState::bind(&globals, &qh),
         toplevels: ToplevelsState::bind(&globals, &qh),
         conn: conn.clone(),
-        layer,
-        bar_output: None,
-        pointer: None,
+        config,
+        instance: wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle()),
         gpu: None,
-        app: BarApp::new(),
-        width: 0,
-        height: BAR_HEIGHT,
-        scale: 1,
+        surfaces: Vec::new(),
+        pointer: None,
         dirty: false,
-        anim_deadline: None,
         last_clock_secs: 0,
-        pointer_pos: (0.0, 0.0),
         exit: false,
     };
 
@@ -113,67 +93,83 @@ fn main() -> Result<()> {
         .insert(event_loop.handle())
         .map_err(|e| anyhow::anyhow!("insert wayland source: {e}"))?;
 
+    // Surfaces are created by `new_output` as outputs are announced
+    // (the same path handles initial enumeration and later hotplug).
     while !bar.exit {
-        // Two redraw deadlines: damascene animation (`next_redraw_in`)
-        // and the clock's next second boundary. Sleep until the
-        // earlier; wayland events interrupt the sleep.
+        // Sleep until the earliest deadline: damascene animation on any
+        // surface, or the clock's next second. Wayland events interrupt.
         let now = Instant::now();
-        let clock_in = Duration::from_millis(1000 - chrono::Local::now().timestamp_subsec_millis() as u64);
+        let clock_in =
+            Duration::from_millis(1000 - chrono::Local::now().timestamp_subsec_millis() as u64);
         let mut timeout = clock_in;
-        if let Some(d) = bar.anim_deadline {
-            timeout = timeout.min(d.saturating_duration_since(now));
+        for s in &bar.surfaces {
+            if let Some(d) = s.anim_deadline {
+                timeout = timeout.min(d.saturating_duration_since(now));
+            }
         }
 
         event_loop
             .dispatch(Some(timeout), &mut bar)
             .context("event loop dispatch")?;
 
-        // A deadline elapsing is itself a reason to redraw.
-        let now = Instant::now();
-        if bar.anim_deadline.is_some_and(|d| d <= now) {
-            bar.anim_deadline = None;
-            bar.dirty = true;
+        // Global state change (workspaces, toplevels) → every bar.
+        if bar.dirty {
+            bar.dirty = false;
+            for s in &mut bar.surfaces {
+                s.dirty = true;
+            }
         }
         // Clock tick: redraw when the displayed second changes.
         let secs = chrono::Local::now().timestamp();
         if secs != bar.last_clock_secs {
             bar.last_clock_secs = secs;
-            bar.dirty = true;
+            for s in &mut bar.surfaces {
+                s.dirty = true;
+            }
+        }
+        // An animation deadline elapsing is a per-surface redraw reason.
+        let now = Instant::now();
+        for s in &mut bar.surfaces {
+            if s.anim_deadline.is_some_and(|d| d <= now) {
+                s.anim_deadline = None;
+                s.dirty = true;
+            }
         }
 
-        if bar.dirty && bar.gpu.is_some() {
-            bar.draw();
+        for i in 0..bar.surfaces.len() {
+            if bar.surfaces[i].dirty {
+                bar.draw(i);
+            }
         }
     }
     Ok(())
 }
 
-/// GPU state, created on the first layer-surface configure (layer-shell
-/// forbids attaching buffers before then, and we don't know our size).
-struct Gpu {
-    // Field order = drop order: surface borrows device resources and
-    // (unsafely) the wl_surface, which `Bar` keeps alive.
-    surface: wgpu::Surface<'static>,
+/// GPU objects shared by every bar surface (one device serves all
+/// swapchains). Created lazily with the first surface, since adapter
+/// selection wants a compatible surface.
+struct GpuShared {
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    runner: Runner,
-    msaa: Option<MsaaTarget>,
-    _instance: wgpu::Instance,
 }
 
-struct Bar {
-    registry_state: RegistryState,
-    output_state: OutputState,
-    seat_state: SeatState,
-    workspaces: WorkspacesState,
-    toplevels: ToplevelsState,
-    conn: Connection,
+/// Swapchain + renderer for one bar surface; created on its first
+/// layer-shell configure (before that we don't know the size).
+struct Swapchain {
+    config: wgpu::SurfaceConfiguration,
+    msaa: Option<MsaaTarget>,
+    runner: Runner,
+}
+
+struct BarSurface {
+    // Drop order: the wgpu surface (unsafely) borrows the wl_surface
+    // kept alive by `layer`, so it must drop first.
+    wgpu_surface: wgpu::Surface<'static>,
+    swapchain: Option<Swapchain>,
     layer: LayerSurface,
-    /// The output our layer surface landed on (from surface_enter).
-    bar_output: Option<wl_output::WlOutput>,
-    pointer: Option<wl_pointer::WlPointer>,
-    gpu: Option<Gpu>,
+    output: wl_output::WlOutput,
+    output_name: String,
     app: BarApp,
     /// Logical (surface-coordinate) size.
     width: u32,
@@ -183,177 +179,257 @@ struct Bar {
     dirty: bool,
     /// When damascene wants the next animation frame.
     anim_deadline: Option<Instant>,
-    /// Unix second of the last clock-driven redraw.
-    last_clock_secs: i64,
     /// Last pointer position in logical px (button events don't carry one).
     pointer_pos: (f64, f64),
+}
+
+struct Bar {
+    registry_state: RegistryState,
+    output_state: OutputState,
+    seat_state: SeatState,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
+    workspaces: WorkspacesState,
+    toplevels: ToplevelsState,
+    conn: Connection,
+    config: Config,
+    instance: wgpu::Instance,
+    gpu: Option<GpuShared>,
+    surfaces: Vec<BarSurface>,
+    pointer: Option<wl_pointer::WlPointer>,
+    /// Global-state redraw flag (protocol events); fanned out to every
+    /// surface's `dirty` in the main loop.
+    dirty: bool,
+    /// Unix second of the last clock-driven redraw.
+    last_clock_secs: i64,
     exit: bool,
 }
 
 impl Bar {
-    fn init_gpu(&mut self) {
+    fn create_bar(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput, name: String) {
+        tracing::info!(output = %name, "creating bar");
+        let surface = self.compositor.create_surface(qh);
+        let layer = self.layer_shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Top,
+            Some("prism-bar"),
+            Some(&output),
+        );
+        let height = self.config.height;
+        let margin = self.config.margin;
+        match self.config.position {
+            Position::Top => {
+                layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
+                layer.set_margin(margin, margin, 0, margin);
+            }
+            Position::Bottom => {
+                layer.set_anchor(Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+                layer.set_margin(0, margin, margin, margin);
+            }
+        }
+        layer.set_size(0, height);
+        // The compositor adds the anchored-edge margin to the zone.
+        layer.set_exclusive_zone(height as i32);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.commit();
+
         // SAFETY: the wl_display and wl_surface pointers stay valid for
-        // the life of `Bar` — `conn` and `layer` are owned by it, and
-        // `Gpu` (holding the wgpu surface) is dropped with it.
+        // the life of this BarSurface — `conn` is owned by `Bar`, the
+        // wl_surface by `layer`, and `wgpu_surface` drops first (field
+        // order).
         let raw_display = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
             NonNull::new(self.conn.backend().display_ptr() as *mut _).expect("display ptr"),
         ));
         let raw_window = RawWindowHandle::Wayland(WaylandWindowHandle::new(
-            NonNull::new(self.layer.wl_surface().id().as_ptr() as *mut _).expect("surface ptr"),
+            NonNull::new(layer.wl_surface().id().as_ptr() as *mut _).expect("surface ptr"),
         ));
-
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let surface = unsafe {
-            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: Some(raw_display),
-                raw_window_handle: raw_window,
-            })
+        let wgpu_surface = unsafe {
+            self.instance
+                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: Some(raw_display),
+                    raw_window_handle: raw_window,
+                })
         }
         .expect("create wgpu surface on layer surface");
 
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        }))
-        .expect("no compatible adapter");
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("prism-bar::device"),
-            ..Default::default()
-        }))
-        .expect("request device");
+        if self.gpu.is_none() {
+            let adapter =
+                pollster::block_on(self.instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::default(),
+                    compatible_surface: Some(&wgpu_surface),
+                    force_fallback_adapter: false,
+                }))
+                .expect("no compatible adapter");
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("prism-bar::device"),
+                    ..Default::default()
+                }))
+                .expect("request device");
+            tracing::info!(backend = ?adapter.get_info().backend, "gpu initialized");
+            self.gpu = Some(GpuShared {
+                adapter,
+                device,
+                queue,
+            });
+        }
 
-        let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
-        // Transparent background: damascene's blend states leave correct
-        // premultiplied coverage in the framebuffer over a transparent
-        // clear, so PreMultiplied is the right composite mode.
-        let alpha_mode = if caps
-            .alpha_modes
-            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
-        {
-            wgpu::CompositeAlphaMode::PreMultiplied
-        } else {
-            tracing::warn!(modes = ?caps.alpha_modes, "no premultiplied alpha; bar will be opaque");
-            caps.alpha_modes[0]
-        };
-        let config = wgpu::SurfaceConfiguration {
-            // COPY_SRC matches the runner's backdrop-snapshot path.
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            format,
-            width: (self.width * self.scale as u32).max(1),
-            height: (self.height * self.scale as u32).max(1),
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode,
-            view_formats: vec![],
-            desired_maximum_frame_latency: 1,
-        };
-        surface.configure(&device, &config);
-
-        let mut runner = Runner::with_caps(
-            &device,
-            &queue,
-            format,
-            MSAA_SAMPLES,
-            RunnerCaps::from_adapter(&adapter),
-        );
-        runner.set_theme(self.app.theme());
-        runner.set_surface_size(config.width, config.height);
-        runner.warm_default_glyphs();
-
-        let msaa = (MSAA_SAMPLES > 1).then(|| {
-            MsaaTarget::new(
-                &device,
-                format,
-                wgpu::Extent3d {
-                    width: config.width,
-                    height: config.height,
-                    depth_or_array_layers: 1,
-                },
-                MSAA_SAMPLES,
-            )
-        });
-
-        tracing::info!(
-            backend = ?adapter.get_info().backend,
-            ?format,
-            "gpu initialized"
-        );
-        self.gpu = Some(Gpu {
-            surface,
-            device,
-            queue,
-            config,
-            runner,
-            msaa,
-            _instance: instance,
+        self.surfaces.push(BarSurface {
+            wgpu_surface,
+            swapchain: None,
+            layer,
+            output,
+            output_name: name,
+            app: BarApp::new(),
+            width: 0,
+            height,
+            scale: 1,
+            dirty: false,
+            anim_deadline: None,
+            pointer_pos: (0.0, 0.0),
         });
     }
 
-    /// Apply the current logical size + scale to the swapchain.
-    fn resize_gpu(&mut self) {
-        let scale = self.scale as u32;
-        let (w, h) = ((self.width * scale).max(1), (self.height * scale).max(1));
-        let Some(gpu) = self.gpu.as_mut() else { return };
-        if gpu.config.width == w && gpu.config.height == h {
-            return;
-        }
-        gpu.config.width = w;
-        gpu.config.height = h;
-        gpu.surface.configure(&gpu.device, &gpu.config);
-        gpu.runner.set_surface_size(w, h);
-        let extent = wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        };
-        if let Some(msaa) = gpu.msaa.as_mut() {
-            if !msaa.matches(extent) {
-                *msaa = MsaaTarget::new(&gpu.device, gpu.config.format, extent, msaa.sample_count);
+    /// Configure (or reconfigure) the swapchain for surface `i` from its
+    /// current logical size + scale.
+    fn configure_swapchain(&mut self, i: usize) {
+        let gpu = self.gpu.as_ref().expect("gpu exists once surfaces do");
+        let s = &mut self.surfaces[i];
+        let scale = s.scale as u32;
+        let (w, h) = ((s.width * scale).max(1), (s.height * scale).max(1));
+
+        match &mut s.swapchain {
+            Some(sc) => {
+                if sc.config.width == w && sc.config.height == h {
+                    return;
+                }
+                sc.config.width = w;
+                sc.config.height = h;
+                s.wgpu_surface.configure(&gpu.device, &sc.config);
+                sc.runner.set_surface_size(w, h);
+                let extent = wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                };
+                if let Some(msaa) = sc.msaa.as_mut() {
+                    if !msaa.matches(extent) {
+                        *msaa =
+                            MsaaTarget::new(&gpu.device, sc.config.format, extent, msaa.sample_count);
+                    }
+                }
+            }
+            None => {
+                let caps = s.wgpu_surface.get_capabilities(&gpu.adapter);
+                let format = caps
+                    .formats
+                    .iter()
+                    .copied()
+                    .find(|f| f.is_srgb())
+                    .unwrap_or(caps.formats[0]);
+                // Transparent background: damascene's blend states leave
+                // correct premultiplied coverage over a transparent
+                // clear, so PreMultiplied is the right composite mode.
+                let alpha_mode = if caps
+                    .alpha_modes
+                    .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+                {
+                    wgpu::CompositeAlphaMode::PreMultiplied
+                } else {
+                    tracing::warn!(
+                        output = %s.output_name,
+                        modes = ?caps.alpha_modes,
+                        "no premultiplied alpha; bar will be opaque"
+                    );
+                    caps.alpha_modes[0]
+                };
+                let config = wgpu::SurfaceConfiguration {
+                    // COPY_SRC matches the runner's backdrop-snapshot path.
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    format,
+                    width: w,
+                    height: h,
+                    present_mode: wgpu::PresentMode::Fifo,
+                    alpha_mode,
+                    view_formats: vec![],
+                    desired_maximum_frame_latency: 1,
+                };
+                s.wgpu_surface.configure(&gpu.device, &config);
+
+                let mut runner = Runner::with_caps(
+                    &gpu.device,
+                    &gpu.queue,
+                    format,
+                    MSAA_SAMPLES,
+                    RunnerCaps::from_adapter(&gpu.adapter),
+                );
+                runner.set_theme(s.app.theme());
+                runner.set_surface_size(w, h);
+                runner.warm_default_glyphs();
+
+                let msaa = (MSAA_SAMPLES > 1).then(|| {
+                    MsaaTarget::new(
+                        &gpu.device,
+                        format,
+                        wgpu::Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                        MSAA_SAMPLES,
+                    )
+                });
+                tracing::info!(output = %s.output_name, ?format, "swapchain configured");
+                s.swapchain = Some(Swapchain {
+                    config,
+                    msaa,
+                    runner,
+                });
             }
         }
     }
 
-    fn draw(&mut self) {
-        self.dirty = false;
-        let Some(gpu) = self.gpu.as_mut() else { return };
+    fn draw(&mut self, i: usize) {
+        // Per-output workspace strip; toplevel title is global focus.
+        let ws = self.workspaces.snapshot(Some(&self.surfaces[i].output));
+        let title = self.toplevels.focused_title();
 
-        let scale = self.scale as f32;
-        let viewport = Rect::new(0.0, 0.0, self.width as f32, self.height as f32);
+        let gpu = self.gpu.as_ref().expect("gpu exists once surfaces do");
+        let s = &mut self.surfaces[i];
+        s.dirty = false;
+        let Some(sc) = s.swapchain.as_mut() else {
+            return; // not configured yet; the configure will redraw
+        };
 
-        self.app.set_state(
-            self.workspaces.snapshot(self.bar_output.as_ref()),
-            self.toplevels.focused_title(),
-        );
-        self.app.before_build();
-        let theme = self.app.theme();
+        let scale = s.scale as f32;
+        let viewport = Rect::new(0.0, 0.0, s.width as f32, s.height as f32);
+
+        s.app.set_state(ws, title);
+        s.app.before_build();
+        let theme = s.app.theme();
         let mut tree = {
             let cx = BuildCx::new(&theme)
-                .with_ui_state(gpu.runner.ui_state())
+                .with_ui_state(sc.runner.ui_state())
                 .with_viewport(viewport.w, viewport.h);
-            self.app.build(&cx)
+            s.app.build(&cx)
         };
-        gpu.runner.set_theme(theme);
-        gpu.runner.set_hotkeys(self.app.hotkeys());
+        sc.runner.set_theme(theme);
+        sc.runner.set_hotkeys(s.app.hotkeys());
 
-        let prepare = gpu
+        let prepare = sc
             .runner
             .prepare(&gpu.device, &gpu.queue, &mut tree, viewport, scale);
 
-        let frame = match gpu.surface.get_current_texture() {
+        let frame = match s.wgpu_surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                gpu.surface.configure(&gpu.device, &gpu.config);
-                self.dirty = true; // try again next loop turn
+                s.wgpu_surface.configure(&gpu.device, &sc.config);
+                s.dirty = true; // try again next loop turn
                 return;
             }
             other => {
-                tracing::error!("surface unavailable: {other:?}");
+                tracing::error!(output = %s.output_name, "surface unavailable: {other:?}");
                 return;
             }
         };
@@ -365,12 +441,12 @@ impl Bar {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("prism-bar::encoder"),
             });
-        gpu.runner.render(
+        sc.runner.render(
             &gpu.device,
             &mut encoder,
             &frame.texture,
             &view,
-            gpu.msaa.as_ref().map(|m| &m.view),
+            sc.msaa.as_ref().map(|m| &m.view),
             // Transparent clear — the visible bar background is a rounded
             // rect in the tree; the compositor sees through the rest.
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -378,49 +454,65 @@ impl Bar {
         gpu.queue.submit(Some(encoder.finish()));
         frame.present();
 
-        self.anim_deadline = prepare.next_redraw_in.map(|d| Instant::now() + d);
-        if prepare.needs_redraw && self.anim_deadline.is_none() {
-            self.anim_deadline = Some(Instant::now());
+        s.anim_deadline = prepare.next_redraw_in.map(|d| Instant::now() + d);
+        if prepare.needs_redraw && s.anim_deadline.is_none() {
+            s.anim_deadline = Some(Instant::now());
         }
     }
 
-    fn dispatch_ui_events(&mut self, events: Vec<damascene_core::UiEvent>) {
+    fn surface_index_for(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
+        self.surfaces
+            .iter()
+            .position(|s| s.layer.wl_surface() == surface)
+    }
+
+    fn dispatch_ui_events(&mut self, i: usize, events: Vec<damascene_core::UiEvent>) {
         if events.is_empty() {
             return;
         }
+        let s = &mut self.surfaces[i];
         for event in events {
-            self.app.on_event(event);
+            s.app.on_event(event);
         }
         // Side effects the app requested (it can't talk wayland itself).
-        if let Some(slot) = self.app.take_activate() {
+        if let Some(slot) = s.app.take_activate() {
             self.workspaces.activate(slot);
         }
-        self.dirty = true;
+        self.surfaces[i].dirty = true;
     }
 }
 
 impl LayerShellHandler for Bar {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
-        self.exit = true;
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        // The compositor dismissed this surface (e.g. output going
+        // away); drop the bar but keep running for hotplug.
+        self.surfaces
+            .retain(|s| s.layer.wl_surface() != layer.wl_surface());
     }
 
     fn configure(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
+        layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        let Some(i) = self.surface_index_for(layer.wl_surface()) else {
+            return;
+        };
         let (w, h) = configure.new_size;
-        self.width = if w > 0 { w } else { self.width.max(1) };
-        self.height = if h > 0 { h } else { BAR_HEIGHT };
-        if self.gpu.is_none() {
-            self.init_gpu();
-        } else {
-            self.resize_gpu();
+        {
+            let s = &mut self.surfaces[i];
+            if w > 0 {
+                s.width = w;
+            }
+            if h > 0 {
+                s.height = h;
+            }
         }
-        self.dirty = true;
+        self.configure_swapchain(i);
+        self.surfaces[i].dirty = true;
     }
 }
 
@@ -429,14 +521,19 @@ impl CompositorHandler for Bar {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         new_factor: i32,
     ) {
-        if self.scale != new_factor {
-            self.scale = new_factor;
-            self.layer.wl_surface().set_buffer_scale(new_factor);
-            self.resize_gpu();
-            self.dirty = true;
+        let Some(i) = self.surface_index_for(surface) else {
+            return;
+        };
+        if self.surfaces[i].scale != new_factor {
+            self.surfaces[i].scale = new_factor;
+            surface.set_buffer_scale(new_factor);
+            if self.surfaces[i].swapchain.is_some() {
+                self.configure_swapchain(i);
+            }
+            self.surfaces[i].dirty = true;
         }
     }
 
@@ -463,11 +560,8 @@ impl CompositorHandler for Bar {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
-        output: &wl_output::WlOutput,
+        _output: &wl_output::WlOutput,
     ) {
-        // Lets the workspace snapshot filter to this output's group.
-        self.bar_output = Some(output.clone());
-        self.dirty = true;
     }
 
     fn surface_leave(
@@ -484,9 +578,49 @@ impl OutputHandler for Bar {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+
+    fn new_output(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        let Some(name) = self.output_state.info(&output).and_then(|i| i.name) else {
+            tracing::warn!("output without a name; skipping");
+            return;
+        };
+        if !self.config.wants_output(&name) {
+            tracing::debug!(output = %name, "not configured for a bar; skipping");
+            return;
+        }
+        if self.surfaces.iter().any(|s| s.output == output) {
+            return;
+        }
+        self.create_bar(qh, output, name);
+    }
+
+    fn update_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+        // Mode/scale changes arrive as layer configure + per-surface
+        // scale_factor_changed; nothing to do here.
+    }
+
+    fn output_destroyed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        let before = self.surfaces.len();
+        self.surfaces.retain(|s| s.output != output);
+        if self.surfaces.len() != before {
+            tracing::info!("output gone; bar removed");
+        }
+    }
 }
 
 impl SeatHandler for Bar {
@@ -534,41 +668,53 @@ impl PointerHandler for Bar {
         events: &[PointerEvent],
     ) {
         for event in events {
-            if event.surface != *self.layer.wl_surface() {
+            let Some(i) = self.surface_index_for(&event.surface) else {
                 continue;
-            }
+            };
             // SCTK positions are surface-local logical coordinates —
             // exactly what damascene's pointer methods take.
             let (x, y) = (event.position.0 as f32, event.position.1 as f32);
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
-                    self.pointer_pos = event.position;
-                    let Some(gpu) = self.gpu.as_mut() else { continue };
-                    let moved = gpu.runner.pointer_moved(Pointer::moving(x, y));
+                    self.surfaces[i].pointer_pos = event.position;
+                    let Some(sc) = self.surfaces[i].swapchain.as_mut() else {
+                        continue;
+                    };
+                    let moved = sc.runner.pointer_moved(Pointer::moving(x, y));
                     let needs_redraw = moved.needs_redraw;
-                    self.dispatch_ui_events(moved.events);
+                    self.dispatch_ui_events(i, moved.events);
                     if needs_redraw {
-                        self.dirty = true;
+                        self.surfaces[i].dirty = true;
                     }
                 }
                 PointerEventKind::Leave { .. } => {
-                    let Some(gpu) = self.gpu.as_mut() else { continue };
-                    let events = gpu.runner.pointer_left();
-                    self.dispatch_ui_events(events);
-                    self.dirty = true;
+                    let Some(sc) = self.surfaces[i].swapchain.as_mut() else {
+                        continue;
+                    };
+                    let events = sc.runner.pointer_left();
+                    self.dispatch_ui_events(i, events);
+                    self.surfaces[i].dirty = true;
                 }
-                PointerEventKind::Press { button, .. } | PointerEventKind::Release { button, .. } => {
-                    let Some(button) = linux_button(button) else { continue };
-                    let (px, py) = (self.pointer_pos.0 as f32, self.pointer_pos.1 as f32);
-                    let Some(gpu) = self.gpu.as_mut() else { continue };
+                PointerEventKind::Press { button, .. }
+                | PointerEventKind::Release { button, .. } => {
+                    let Some(button) = linux_button(button) else {
+                        continue;
+                    };
+                    let (px, py) = (
+                        self.surfaces[i].pointer_pos.0 as f32,
+                        self.surfaces[i].pointer_pos.1 as f32,
+                    );
+                    let Some(sc) = self.surfaces[i].swapchain.as_mut() else {
+                        continue;
+                    };
                     let p = Pointer::mouse(px, py, button);
                     let events = if matches!(event.kind, PointerEventKind::Press { .. }) {
-                        gpu.runner.pointer_down(p)
+                        sc.runner.pointer_down(p)
                     } else {
-                        gpu.runner.pointer_up(p)
+                        sc.runner.pointer_up(p)
                     };
-                    self.dispatch_ui_events(events);
-                    self.dirty = true;
+                    self.dispatch_ui_events(i, events);
+                    self.surfaces[i].dirty = true;
                 }
                 PointerEventKind::Axis { .. } => {}
             }
