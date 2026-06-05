@@ -9,8 +9,6 @@ use std::time::{Duration, Instant};
 
 use crate::config::Module;
 
-/// How often to resample.
-pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// One render-ready reading. Fractions are `0.0..=1.0`.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -26,6 +24,7 @@ pub struct SysMon {
     want_cpu: bool,
     want_mem: bool,
     disk_paths: Vec<String>,
+    interval: Duration,
     /// (busy, total) jiffies from the previous /proc/stat read.
     prev_cpu: Option<(u64, u64)>,
     pub stats: SysStats,
@@ -33,8 +32,9 @@ pub struct SysMon {
 }
 
 impl SysMon {
-    /// Sampler scoped to what the configured modules display.
-    pub fn new(modules: &[Module]) -> Self {
+    /// Sampler scoped to what the configured modules display,
+    /// resampling every `interval_secs`.
+    pub fn new(modules: &[Module], interval_secs: u64) -> Self {
         let mut disk_paths: Vec<String> = Vec::new();
         for m in modules {
             if let Module::Disk(d) = m {
@@ -47,6 +47,7 @@ impl SysMon {
             want_cpu: modules.iter().any(|m| matches!(m, Module::Cpu(_))),
             want_mem: modules.iter().any(|m| matches!(m, Module::Memory(_))),
             disk_paths,
+            interval: Duration::from_secs(interval_secs),
             prev_cpu: None,
             stats: SysStats::default(),
             next_sample: Instant::now(),
@@ -64,7 +65,7 @@ impl SysMon {
     /// Take a fresh reading and arm the next deadline. Returns true if
     /// the rendered stats changed.
     pub fn sample(&mut self) -> bool {
-        self.next_sample = Instant::now() + SAMPLE_INTERVAL;
+        self.next_sample = Instant::now() + self.interval;
         let new = SysStats {
             cpu: self.want_cpu.then(|| self.sample_cpu()).flatten(),
             mem: self.want_mem.then(sample_mem).flatten(),

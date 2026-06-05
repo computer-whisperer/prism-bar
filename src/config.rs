@@ -43,9 +43,74 @@ pub struct Config {
     /// Screen edge the bar docks to.
     #[knuffel(child, unwrap(argument, str), default)]
     pub position: Position,
+    /// Panel background alpha, `0.0..=1.0`.
+    #[knuffel(child, unwrap(argument), default = 0.8)]
+    pub opacity: f32,
+    /// Panel corner radius in logical pixels.
+    #[knuffel(child, unwrap(argument), default = 12)]
+    pub radius: u32,
+    /// Color palette; see [`ThemeName`] for the vocabulary.
+    #[knuffel(child, unwrap(argument, str), default)]
+    pub theme: ThemeName,
+    /// Whether the panel draws its border stroke.
+    #[knuffel(child, unwrap(argument), default = true)]
+    pub border: bool,
+    /// System monitor poll cadence in seconds.
+    #[knuffel(child, unwrap(argument), default = 2)]
+    pub sample_interval: u64,
+    /// Focused-window title truncation length (characters).
+    #[knuffel(child, unwrap(argument), default = 80)]
+    pub title_max_length: u32,
     /// Right-side modules in display order. None = default set.
     #[knuffel(child)]
     modules: Option<Modules>,
+}
+
+/// The eight stock damascene palettes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeName {
+    #[default]
+    Dark,
+    Light,
+    SlateBlueDark,
+    SlateBlueLight,
+    SandAmberDark,
+    SandAmberLight,
+    MauveVioletDark,
+    MauveVioletLight,
+}
+
+impl std::str::FromStr for ThemeName {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "dark" => Self::Dark,
+            "light" => Self::Light,
+            "slate-blue-dark" => Self::SlateBlueDark,
+            "slate-blue-light" => Self::SlateBlueLight,
+            "sand-amber-dark" => Self::SandAmberDark,
+            "sand-amber-light" => Self::SandAmberLight,
+            "mauve-violet-dark" => Self::MauveVioletDark,
+            "mauve-violet-light" => Self::MauveVioletLight,
+            other => {
+                return Err(format!(
+                    "unknown theme \"{other}\"; expected one of: dark, light, \
+                     slate-blue-dark, slate-blue-light, sand-amber-dark, \
+                     sand-amber-light, mauve-violet-dark, mauve-violet-light"
+                ));
+            }
+        })
+    }
+}
+
+/// Appearance values shared with every BarApp.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Appearance {
+    pub opacity: f32,
+    pub radius: f32,
+    pub theme: ThemeName,
+    pub border: bool,
+    pub title_max_length: usize,
 }
 
 #[derive(Debug, knuffel::Decode)]
@@ -68,6 +133,12 @@ pub struct GaugeOpts {
     /// Percentage at which the gauge tints destructive.
     #[knuffel(property, default = 90)]
     pub hot: u32,
+    /// Bar length in logical pixels.
+    #[knuffel(property, default = 84)]
+    pub width: u32,
+    /// Bar thickness in logical pixels.
+    #[knuffel(property, default = 5)]
+    pub thickness: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, knuffel::Decode)]
@@ -77,6 +148,10 @@ pub struct DiskOpts {
     pub path: String,
     #[knuffel(property, default = 90)]
     pub hot: u32,
+    #[knuffel(property, default = 84)]
+    pub width: u32,
+    #[knuffel(property, default = 5)]
+    pub thickness: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, knuffel::Decode)]
@@ -118,6 +193,12 @@ impl Default for Config {
             height: 40,
             margin: 6,
             position: Position::Top,
+            opacity: 0.8,
+            radius: 12,
+            theme: ThemeName::Dark,
+            border: true,
+            sample_interval: 2,
+            title_max_length: 80,
             modules: None,
         }
     }
@@ -131,19 +212,37 @@ impl Config {
 
     /// Right-cluster modules in display order.
     pub fn modules(&self) -> Vec<Module> {
+        const GAUGE: GaugeOpts = GaugeOpts {
+            hot: 90,
+            width: 84,
+            thickness: 5,
+        };
         match &self.modules {
             Some(m) => m.list.clone(),
             None => vec![
-                Module::Cpu(GaugeOpts { hot: 90 }),
-                Module::Memory(GaugeOpts { hot: 90 }),
+                Module::Cpu(GAUGE),
+                Module::Memory(GAUGE),
                 Module::Disk(DiskOpts {
                     path: "/".into(),
                     hot: 90,
+                    width: 84,
+                    thickness: 5,
                 }),
                 Module::Clock(ClockOpts {
                     format: "%H:%M:%S".into(),
                 }),
             ],
+        }
+    }
+
+    /// Appearance values shared with every BarApp.
+    pub fn appearance(&self) -> Appearance {
+        Appearance {
+            opacity: self.opacity,
+            radius: self.radius as f32,
+            theme: self.theme,
+            border: self.border,
+            title_max_length: self.title_max_length as usize,
         }
     }
 
@@ -187,7 +286,7 @@ impl Config {
 
     /// Checks knuffel can't express — currently: clock formats must
     /// actually format (a bad chrono specifier would otherwise panic
-    /// at render time, once a second).
+    /// at render time, once a second), and scalar ranges.
     fn validate(&self) -> Result<()> {
         use std::fmt::Write;
         for m in self.modules() {
@@ -197,6 +296,12 @@ impl Config {
                     anyhow::bail!("invalid clock format string: {:?}", c.format);
                 }
             }
+        }
+        if !(0.0..=1.0).contains(&self.opacity) {
+            anyhow::bail!("opacity must be within 0.0..=1.0, got {}", self.opacity);
+        }
+        if self.sample_interval == 0 {
+            anyhow::bail!("sample-interval must be at least 1 second");
         }
         Ok(())
     }

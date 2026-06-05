@@ -26,13 +26,34 @@ margin 6
 // Screen edge the bar docks to: "top" or "bottom".
 position "top"
 
+// Panel background alpha, 0.0 (invisible) to 1.0 (opaque).
+opacity 0.8
+
+// Panel corner radius in logical pixels.
+radius 12
+
+// Color palette. One of: "dark", "light", "slate-blue-dark",
+// "slate-blue-light", "sand-amber-dark", "sand-amber-light",
+// "mauve-violet-dark", "mauve-violet-light".
+theme "dark"
+
+// Whether the panel draws its border stroke.
+border true
+
+// System monitor poll cadence, seconds.
+sample-interval 2
+
+// Focused-window title truncation length, characters.
+title-max-length 80
+
 // Right-side modules, in display order. Presence enables a module;
 // omitting the whole block keeps the default set shown here.
 modules {
-    // CPU load gauge (aggregate, sampled from /proc/stat every 2s).
-    // hot= is the integer percentage where the gauge fill switches to
-    // the destructive accent.
-    cpu hot=90
+    // CPU load gauge (aggregate, from /proc/stat). Gauge options on
+    // cpu/memory/disk: hot= is the integer percentage where the fill
+    // switches to the destructive accent; width= and thickness= size
+    // the bar in logical pixels.
+    cpu hot=90 width=84 thickness=5
 
     // Memory usage gauge (1 - MemAvailable/MemTotal).
     memory hot=90

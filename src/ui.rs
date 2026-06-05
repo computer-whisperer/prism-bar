@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 use damascene_core::prelude::*;
 use damascene_core::SvgIcon;
 
-use crate::config::Module;
+use crate::config::{Appearance, Module, ThemeName};
 use crate::sysmon::SysStats;
 use crate::workspaces::WorkspaceView;
 
@@ -30,13 +30,10 @@ static ICON_DISK: LazyLock<SvgIcon> = LazyLock::new(|| {
         .expect("hard-drive.svg")
 });
 
-/// Longest title before middle-truncation; keeps the title from
-/// crowding the clock until proper width-constrained truncation.
-const TITLE_MAX_CHARS: usize = 80;
-
 pub struct BarApp {
     /// Right-cluster modules in display order (from config).
     modules: Rc<Vec<Module>>,
+    appearance: Rc<Appearance>,
     /// Formatted text per Clock module, in module order.
     clocks: Vec<String>,
     workspaces: Vec<WorkspaceView>,
@@ -47,9 +44,10 @@ pub struct BarApp {
 }
 
 impl BarApp {
-    pub fn new(modules: Rc<Vec<Module>>) -> Self {
+    pub fn new(modules: Rc<Vec<Module>>, appearance: Rc<Appearance>) -> Self {
         Self {
             modules,
+            appearance,
             clocks: Vec::new(),
             workspaces: Vec::new(),
             title: None,
@@ -77,6 +75,19 @@ impl BarApp {
 }
 
 impl App for BarApp {
+    fn theme(&self) -> Theme {
+        match self.appearance.theme {
+            ThemeName::Dark => Theme::damascene_dark(),
+            ThemeName::Light => Theme::damascene_light(),
+            ThemeName::SlateBlueDark => Theme::radix_slate_blue_dark(),
+            ThemeName::SlateBlueLight => Theme::radix_slate_blue_light(),
+            ThemeName::SandAmberDark => Theme::radix_sand_amber_dark(),
+            ThemeName::SandAmberLight => Theme::radix_sand_amber_light(),
+            ThemeName::MauveVioletDark => Theme::radix_mauve_violet_dark(),
+            ThemeName::MauveVioletLight => Theme::radix_mauve_violet_light(),
+        }
+    }
+
     fn before_build(&mut self) {
         let now = chrono::Local::now();
         self.clocks = self
@@ -110,7 +121,7 @@ impl App for BarApp {
             .collect();
 
         let title = self.title.as_deref().map(|t| {
-            let t = middle_truncate(t, TITLE_MAX_CHARS);
+            let t = middle_truncate(t, self.appearance.title_max_length);
             text(t).label().muted()
         });
 
@@ -130,12 +141,16 @@ impl App for BarApp {
             match module {
                 Module::Cpu(o) => {
                     if let Some(frac) = self.sys.cpu {
-                        right.push(gauge_module(&ICON_CPU, frac, o.hot, palette, None));
+                        right.push(gauge_module(
+                            &ICON_CPU, frac, o.hot, o.width, o.thickness, palette, None,
+                        ));
                     }
                 }
                 Module::Memory(o) => {
                     if let Some(frac) = self.sys.mem {
-                        right.push(gauge_module(&ICON_MEM, frac, o.hot, palette, None));
+                        right.push(gauge_module(
+                            &ICON_MEM, frac, o.hot, o.width, o.thickness, palette, None,
+                        ));
                     }
                 }
                 Module::Disk(o) => {
@@ -148,7 +163,9 @@ impl App for BarApp {
                     if let Some(frac) = frac {
                         // Label non-root mounts so two disk gauges read.
                         let label = (o.path != "/").then_some(o.path.as_str());
-                        right.push(gauge_module(&ICON_DISK, frac, o.hot, palette, label));
+                        right.push(gauge_module(
+                            &ICON_DISK, frac, o.hot, o.width, o.thickness, palette, label,
+                        ));
                     }
                 }
                 Module::Clock(_) => {
@@ -164,14 +181,17 @@ impl App for BarApp {
         // The wl_surface is cleared transparent; the visible bar is this
         // rounded translucent panel, floated off the screen edge by the
         // layer-surface margins set in the host.
-        row(items)
+        let mut panel = row(items)
             .fill_width()
             .align(Align::Center)
             .gap(tokens::SPACE_3)
             .padding(Sides::x(tokens::SPACE_3))
-            .fill(palette.background.with_alpha(0.80))
-            .stroke(palette.border.with_alpha(0.6))
-            .radius(12.0)
+            .fill(palette.background.with_alpha(self.appearance.opacity))
+            .radius(self.appearance.radius);
+        if self.appearance.border {
+            panel = panel.stroke(palette.border.with_alpha(0.6));
+        }
+        panel
     }
 
     fn on_event(&mut self, event: UiEvent) {
@@ -229,7 +249,15 @@ fn tabular(s: &str, digit_w: f32, mk: &dyn Fn(String) -> El) -> El {
 /// number alignment. Nothing moves as values change, and both static
 /// anchors (icon, bar) bracket the variable part. The fill shifts to
 /// the destructive accent past the module's `hot` threshold (percent).
-fn gauge_module(svg: &SvgIcon, frac: f32, hot: u32, palette: &Palette, label: Option<&str>) -> El {
+fn gauge_module(
+    svg: &SvgIcon,
+    frac: f32,
+    hot: u32,
+    width: u32,
+    thickness: u32,
+    palette: &Palette,
+    label: Option<&str>,
+) -> El {
     let fill = if frac * 100.0 >= hot as f32 {
         palette.destructive
     } else {
@@ -249,8 +277,8 @@ fn gauge_module(svg: &SvgIcon, frac: f32, hot: u32, palette: &Palette, label: Op
     ));
     items.push(
         progress(frac, fill)
-            .width(Size::Fixed(84.0))
-            .height(Size::Fixed(5.0)),
+            .width(Size::Fixed(width as f32))
+            .height(Size::Fixed(thickness as f32)),
     );
     row(items).gap(tokens::SPACE_1).align(Align::Center)
 }

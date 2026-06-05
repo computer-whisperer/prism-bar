@@ -51,7 +51,7 @@ use damascene_core::prelude::{App, Rect};
 use damascene_core::BuildCx;
 use damascene_wgpu::{MsaaTarget, Runner, RunnerCaps};
 
-use crate::config::{Config, Module, Position};
+use crate::config::{Appearance, Config, Module, Position};
 use crate::sysmon::SysMon;
 use crate::toplevels::ToplevelsState;
 use crate::ui::BarApp;
@@ -69,6 +69,8 @@ fn main() -> Result<()> {
 
     let config = Config::load()?;
     let modules = Rc::new(config.modules());
+    let appearance = Rc::new(config.appearance());
+    let sample_interval = config.sample_interval;
 
     let conn = Connection::connect_to_env().context("connect to wayland")?;
     let (globals, event_queue) = registry_queue_init::<Bar>(&conn).context("registry init")?;
@@ -88,9 +90,10 @@ fn main() -> Result<()> {
         gpu: None,
         surfaces: Vec::new(),
         pointer: None,
-        sysmon: SysMon::new(&modules),
+        sysmon: SysMon::new(&modules, sample_interval),
         has_clock: modules.iter().any(|m| matches!(m, Module::Clock(_))),
         modules,
+        appearance,
         reload_at: None,
         dirty: false,
         last_clock_secs: 0,
@@ -233,6 +236,7 @@ struct Bar {
     sysmon: SysMon,
     /// Right-cluster module specs shared with every BarApp.
     modules: Rc<Vec<Module>>,
+    appearance: Rc<Appearance>,
     has_clock: bool,
     /// Debounced config-reload deadline (armed by the inotify source).
     reload_at: Option<Instant>,
@@ -326,7 +330,7 @@ impl Bar {
             layer,
             output,
             output_name: name,
-            app: BarApp::new(self.modules.clone()),
+            app: BarApp::new(self.modules.clone(), self.appearance.clone()),
             width: 0,
             height: self.config.height,
             scale: 1,
@@ -349,8 +353,9 @@ impl Bar {
         tracing::info!("config reloaded");
         self.config = new;
         self.modules = Rc::new(self.config.modules());
+        self.appearance = Rc::new(self.config.appearance());
         self.has_clock = self.modules.iter().any(|m| matches!(m, Module::Clock(_)));
-        self.sysmon = SysMon::new(&self.modules);
+        self.sysmon = SysMon::new(&self.modules, self.config.sample_interval);
 
         // Drop bars on outputs the new config no longer wants.
         self.surfaces.retain(|s| {
@@ -365,7 +370,7 @@ impl Bar {
             Self::apply_layer_geometry(&self.config, &s.layer);
             s.layer.commit();
             s.height = self.config.height;
-            s.app = BarApp::new(self.modules.clone());
+            s.app = BarApp::new(self.modules.clone(), self.appearance.clone());
             s.dirty = true;
         }
         // Create bars on newly wanted outputs.
