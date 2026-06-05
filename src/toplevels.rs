@@ -8,6 +8,7 @@
 
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::GlobalList;
+use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_handle_v1::{
     self, ZwlrForeignToplevelHandleV1,
@@ -33,6 +34,9 @@ struct ToplevelData {
     title: Option<String>,
     app_id: Option<String>,
     activated: bool,
+    /// Outputs the toplevel is visible on. Enter/leave are deltas, so
+    /// they apply immediately (rendering still waits for `done`).
+    outputs: Vec<WlOutput>,
     // Pending changes since the last `done` (None = not re-sent, keep
     // the applied value).
     pending_title: Option<String>,
@@ -57,9 +61,14 @@ impl ToplevelsState {
         }
     }
 
-    /// Title (preferred) or app id of the activated toplevel.
-    pub fn focused_title(&self) -> Option<String> {
-        let focused = self.toplevels.iter().find(|t| t.activated)?;
+    /// Title (preferred) or app id of the activated toplevel, filtered
+    /// to one shown on `output` — each bar titles its own display. A
+    /// toplevel spanning outputs titles every bar it touches.
+    pub fn focused_title(&self, output: &WlOutput) -> Option<String> {
+        let focused = self
+            .toplevels
+            .iter()
+            .find(|t| t.activated && t.outputs.contains(output))?;
         focused.title.clone().or_else(|| focused.app_id.clone())
     }
 
@@ -84,6 +93,7 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for Bar {
                     title: None,
                     app_id: None,
                     activated: false,
+                    outputs: Vec::new(),
                     pending_title: None,
                     pending_app_id: None,
                     pending_activated: None,
@@ -133,6 +143,16 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Bar {
                             .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
                             .any(|s| s == STATE_ACTIVATED),
                     );
+                }
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::OutputEnter { output } => {
+                if let Some(t) = bar.toplevels.toplevel_mut(&id) {
+                    t.outputs.push(output);
+                }
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::OutputLeave { output } => {
+                if let Some(t) = bar.toplevels.toplevel_mut(&id) {
+                    t.outputs.retain(|o| o != &output);
                 }
             }
             zwlr_foreign_toplevel_handle_v1::Event::Done => {

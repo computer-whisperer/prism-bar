@@ -391,9 +391,10 @@ impl Bar {
     }
 
     fn draw(&mut self, i: usize) {
-        // Per-output workspace strip; toplevel title is global focus.
+        // Per-output workspace strip and title: each bar describes its
+        // own display.
         let ws = self.workspaces.snapshot(Some(&self.surfaces[i].output));
-        let title = self.toplevels.focused_title();
+        let title = self.toplevels.focused_title(&self.surfaces[i].output);
 
         let gpu = self.gpu.as_ref().expect("gpu exists once surfaces do");
         let s = &mut self.surfaces[i];
