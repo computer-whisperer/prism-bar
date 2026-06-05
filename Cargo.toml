@@ -19,6 +19,12 @@ wayland-client = "0.31"
 # The system libwayland backend is required: wgpu's Vulkan WSI takes raw
 # `wl_display`/`wl_surface` pointers, which the pure-Rust backend can't give.
 wayland-backend = { version = "0.3", features = ["client_system"] }
+# State protocols, hand-wired (SCTK has no helpers for these):
+# ext-workspace-v1 (workspace strip) and wlr-foreign-toplevel-management
+# (focused window title). Both optional at runtime — the bar degrades
+# gracefully when the compositor doesn't advertise them.
+wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 # UI toolkit. The winit host is bypassed: we own the layer surface and
 # event loop, and drive the wgpu Runner directly (custom-host path).

@@ -10,7 +10,9 @@
 //!   calloop: wayland socket + redraw deadlines (animation, clock)
 //!   SCTK pointer events → runner.pointer_*() → app.on_event()
 
+mod toplevels;
 mod ui;
+mod workspaces;
 
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
@@ -44,7 +46,9 @@ use damascene_core::prelude::{App, Rect};
 use damascene_core::BuildCx;
 use damascene_wgpu::{MsaaTarget, Runner, RunnerCaps};
 
+use crate::toplevels::ToplevelsState;
 use crate::ui::BarApp;
+use crate::workspaces::WorkspacesState;
 
 /// Bar height / floating margin in logical pixels. Will come from config.
 const BAR_HEIGHT: u32 = 40;
@@ -86,8 +90,11 @@ fn main() -> Result<()> {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
         seat_state: SeatState::new(&globals, &qh),
+        workspaces: WorkspacesState::bind(&globals, &qh),
+        toplevels: ToplevelsState::bind(&globals, &qh),
         conn: conn.clone(),
         layer,
+        bar_output: None,
         pointer: None,
         gpu: None,
         app: BarApp::new(),
@@ -159,8 +166,12 @@ struct Bar {
     registry_state: RegistryState,
     output_state: OutputState,
     seat_state: SeatState,
+    workspaces: WorkspacesState,
+    toplevels: ToplevelsState,
     conn: Connection,
     layer: LayerSurface,
+    /// The output our layer surface landed on (from surface_enter).
+    bar_output: Option<wl_output::WlOutput>,
     pointer: Option<wl_pointer::WlPointer>,
     gpu: Option<Gpu>,
     app: BarApp,
@@ -315,6 +326,10 @@ impl Bar {
         let scale = self.scale as f32;
         let viewport = Rect::new(0.0, 0.0, self.width as f32, self.height as f32);
 
+        self.app.set_state(
+            self.workspaces.snapshot(self.bar_output.as_ref()),
+            self.toplevels.focused_title(),
+        );
         self.app.before_build();
         let theme = self.app.theme();
         let mut tree = {
@@ -375,6 +390,10 @@ impl Bar {
         }
         for event in events {
             self.app.on_event(event);
+        }
+        // Side effects the app requested (it can't talk wayland itself).
+        if let Some(slot) = self.app.take_activate() {
+            self.workspaces.activate(slot);
         }
         self.dirty = true;
     }
@@ -444,8 +463,11 @@ impl CompositorHandler for Bar {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
     ) {
+        // Lets the workspace snapshot filter to this output's group.
+        self.bar_output = Some(output.clone());
+        self.dirty = true;
     }
 
     fn surface_leave(
