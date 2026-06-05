@@ -116,9 +116,7 @@ impl App for BarApp {
                 items.push(gauge_module(svg, frac, palette));
             }
         }
-        // Monospace digits: every glyph has the same advance, so the
-        // ticking clock never reflows the row.
-        items.push(mono(self.clock.clone()).label());
+        items.push(tabular(&self.clock, *DIGIT_W_LABEL, &|s| text(s).label()));
 
         // The wl_surface is cleared transparent; the visible bar is this
         // rounded translucent panel, floated off the screen edge by the
@@ -142,6 +140,45 @@ impl App for BarApp {
     }
 }
 
+// Widest Inter digit advance per text role, mirroring the role recipes
+// in damascene's `apply_text_role` (label = TEXT_SM/Medium, caption =
+// TEXT_XS/Regular). Measured once; used to emulate tabular numerals.
+static DIGIT_W_LABEL: LazyLock<f32> = LazyLock::new(|| {
+    max_digit_width(tokens::TEXT_SM.size, FontWeight::Medium)
+});
+static DIGIT_W_CAPTION: LazyLock<f32> = LazyLock::new(|| {
+    max_digit_width(tokens::TEXT_XS.size, FontWeight::Regular)
+});
+
+fn max_digit_width(size: f32, weight: FontWeight) -> f32 {
+    (0..10u8)
+        .map(|d| line_width(&d.to_string(), size, weight, false))
+        .fold(0.0, f32::max)
+}
+
+/// Emulated tabular numerals: digits (and pad spaces) each occupy a
+/// fixed slot of the widest digit's width, centered like real `tnum`
+/// figures; other glyphs (`:`/`%`) keep their natural advance. Value
+/// changes can never reflow the surrounding layout.
+fn tabular(s: &str, digit_w: f32, mk: &dyn Fn(String) -> El) -> El {
+    let cells: Vec<El> = s
+        .chars()
+        .map(|c| {
+            if c == ' ' {
+                row(Vec::<El>::new()).width(Size::Fixed(digit_w))
+            } else if c.is_ascii_digit() {
+                row([mk(c.to_string())])
+                    .width(Size::Fixed(digit_w))
+                    .justify(Justify::Center)
+                    .align(Align::Center)
+            } else {
+                mk(c.to_string())
+            }
+        })
+        .collect();
+    row(cells).align(Align::Center)
+}
+
 /// icon + mini gauge + percentage. The gauge fill shifts to the
 /// destructive accent as the resource runs hot.
 fn gauge_module(svg: &SvgIcon, frac: f32, palette: &Palette) -> El {
@@ -155,9 +192,9 @@ fn gauge_module(svg: &SvgIcon, frac: f32, palette: &Palette) -> El {
         progress(frac, fill)
             .width(Size::Fixed(42.0))
             .height(Size::Fixed(5.0)),
-        // Monospace + space-padded to 3 digits: "  4%" and "100%" are
-        // the same width, so value changes never shift the layout.
-        mono(format!("{:>3.0}%", frac * 100.0)).caption().muted(),
+        tabular(&format!("{:>3.0}%", frac * 100.0), *DIGIT_W_CAPTION, &|s| {
+            text(s).caption().muted()
+        }),
     ])
     .gap(tokens::SPACE_1)
     .align(Align::Center)
