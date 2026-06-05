@@ -122,17 +122,20 @@ impl App for BarApp {
             items.push(title);
         }
         items.push(spacer());
+        // Right cluster gets its own row with a wider gap so the
+        // module groups separate clearly.
+        let mut right: Vec<El> = Vec::new();
         let mut clock_i = 0;
         for module in self.modules.iter() {
             match module {
                 Module::Cpu(o) => {
                     if let Some(frac) = self.sys.cpu {
-                        items.push(gauge_module(&ICON_CPU, frac, o.hot, palette, None));
+                        right.push(gauge_module(&ICON_CPU, frac, o.hot, palette, None));
                     }
                 }
                 Module::Memory(o) => {
                     if let Some(frac) = self.sys.mem {
-                        items.push(gauge_module(&ICON_MEM, frac, o.hot, palette, None));
+                        right.push(gauge_module(&ICON_MEM, frac, o.hot, palette, None));
                     }
                 }
                 Module::Disk(o) => {
@@ -145,17 +148,18 @@ impl App for BarApp {
                     if let Some(frac) = frac {
                         // Label non-root mounts so two disk gauges read.
                         let label = (o.path != "/").then_some(o.path.as_str());
-                        items.push(gauge_module(&ICON_DISK, frac, o.hot, palette, label));
+                        right.push(gauge_module(&ICON_DISK, frac, o.hot, palette, label));
                     }
                 }
                 Module::Clock(_) => {
                     if let Some(clock) = self.clocks.get(clock_i) {
-                        items.push(tabular(clock, *DIGIT_W_LABEL, &|s| text(s).label()));
+                        right.push(tabular(clock, *DIGIT_W_LABEL, &|s| text(s).label()));
                     }
                     clock_i += 1;
                 }
             }
         }
+        items.push(row(right).gap(tokens::SPACE_5).align(Align::Center));
 
         // The wl_surface is cleared transparent; the visible bar is this
         // rounded translucent panel, floated off the screen edge by the
@@ -188,10 +192,6 @@ static DIGIT_W_LABEL: LazyLock<f32> = LazyLock::new(|| {
 static DIGIT_W_CAPTION: LazyLock<f32> = LazyLock::new(|| {
     max_digit_width(tokens::TEXT_XS.size, FontWeight::Regular)
 });
-/// Natural advance of '%' at caption size; the gauge column is sized
-/// to exactly fit "100%" (3 digit slots + this).
-static PCT_GLYPH_W: LazyLock<f32> =
-    LazyLock::new(|| line_width("%", tokens::TEXT_XS.size, FontWeight::Regular, false));
 
 fn max_digit_width(size: f32, weight: FontWeight) -> f32 {
     (0..10u8)
@@ -222,33 +222,36 @@ fn tabular(s: &str, digit_w: f32, mk: &dyn Fn(String) -> El) -> El {
     row(cells).align(Align::Center)
 }
 
-/// icon + a tight percent-over-bar column. Stacking the number on its
-/// own gauge keeps them reading as one unit at any value — a low
-/// percentage can't drift toward the neighboring module. Both rows
-/// share one fixed width (sized to "100%"), digits right-aligned, so
-/// nothing moves as values change. The fill shifts to the destructive
-/// accent past the module's `hot` threshold (percent).
+/// icon + percent + bar. The percent sits between icon and bar with
+/// digits right-aligned in fixed slots, so the visible digits stay
+/// pinned against their own bar at any value — the unused pad slots
+/// fall next to the icon, inside the module, where they read as
+/// number alignment. Nothing moves as values change, and both static
+/// anchors (icon, bar) bracket the variable part. The fill shifts to
+/// the destructive accent past the module's `hot` threshold (percent).
 fn gauge_module(svg: &SvgIcon, frac: f32, hot: u32, palette: &Palette, label: Option<&str>) -> El {
     let fill = if frac * 100.0 >= hot as f32 {
         palette.destructive
     } else {
         palette.primary
     };
-    let width = 3.0 * *DIGIT_W_CAPTION + *PCT_GLYPH_W;
-    let gauge = column([
-        tabular(&format!("{:>3.0}%", frac * 100.0), *DIGIT_W_CAPTION, &|s| {
-            text(s).caption().muted()
-        }),
-        progress(frac, fill).height(Size::Fixed(4.0)),
-    ])
-    .width(Size::Fixed(width))
-    .gap(3.0);
-
     let mut items = vec![icon(svg.clone())];
     if let Some(label) = label {
         items.push(text(label.to_string()).caption().muted());
     }
-    items.push(gauge);
+    // Two digit slots: 0-99 cover steady state with minimal slack next
+    // to the icon. A pegged 100% widens the module by one slot — rare
+    // enough that the disturbance is earned.
+    items.push(tabular(
+        &format!("{:>2.0}%", frac * 100.0),
+        *DIGIT_W_CAPTION,
+        &|s| text(s).caption().muted(),
+    ));
+    items.push(
+        progress(frac, fill)
+            .width(Size::Fixed(84.0))
+            .height(Size::Fixed(5.0)),
+    );
     row(items).gap(tokens::SPACE_1).align(Align::Center)
 }
 
