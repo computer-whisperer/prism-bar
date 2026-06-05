@@ -1,0 +1,48 @@
+// prism-bar configuration.
+//
+// Lives at ~/.config/prism-bar/config.kdl (or $XDG_CONFIG_HOME/prism-bar/),
+// overridable with $PRISM_BAR_CONFIG. Every setting below is optional;
+// a missing file or omitted node means the built-in default. A file
+// that fails to parse is an error — prism-bar will not silently fall
+// back to defaults over a typo.
+
+// Which outputs (connector names) get a bar. Repeat the node per
+// output. Omitting every `output` node puts a bar on all outputs,
+// including ones hotplugged later.
+//
+// output "DP-1"
+// output "HDMI-A-1"
+
+// Bar height in logical pixels.
+height 40
+
+// Floating margin off the screen edges, logical pixels. The bar's
+// exclusive zone (the space tiled windows avoid) is height + margin.
+margin 6
+
+// Screen edge the bar docks to: "top" or "bottom".
+position "top"
+
+// Right-side modules, in display order. Presence enables a module;
+// omitting the whole block keeps the default set shown here.
+modules {
+    // CPU load gauge (aggregate, sampled from /proc/stat every 2s).
+    // hot= is the integer percentage where the gauge fill switches to
+    // the destructive accent.
+    cpu hot=90
+
+    // Memory usage gauge (1 - MemAvailable/MemTotal).
+    memory hot=90
+
+    // Disk usage gauge for a mount point (df semantics). Repeatable —
+    // one gauge per node. Mounts other than "/" get a small path label
+    // next to the icon.
+    disk "/" hot=90
+    // disk "/home"
+
+    // Clock. format= is a chrono strftime string; it is validated at
+    // startup. Non-digit text (e.g. day names from %a) can vary in
+    // width; digits render in fixed slots and never jitter.
+    clock format="%H:%M:%S"
+    // clock format="%a %b %d  %H:%M"
+}
