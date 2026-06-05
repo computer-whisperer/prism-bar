@@ -188,6 +188,10 @@ static DIGIT_W_LABEL: LazyLock<f32> = LazyLock::new(|| {
 static DIGIT_W_CAPTION: LazyLock<f32> = LazyLock::new(|| {
     max_digit_width(tokens::TEXT_XS.size, FontWeight::Regular)
 });
+/// Natural advance of '%' at caption size; the gauge column is sized
+/// to exactly fit "100%" (3 digit slots + this).
+static PCT_GLYPH_W: LazyLock<f32> =
+    LazyLock::new(|| line_width("%", tokens::TEXT_XS.size, FontWeight::Regular, false));
 
 fn max_digit_width(size: f32, weight: FontWeight) -> f32 {
     (0..10u8)
@@ -218,28 +222,33 @@ fn tabular(s: &str, digit_w: f32, mk: &dyn Fn(String) -> El) -> El {
     row(cells).align(Align::Center)
 }
 
-/// icon + mini gauge + percentage. The gauge fill shifts to the
-/// destructive accent past the module's `hot` threshold (percent).
+/// icon + a tight percent-over-bar column. Stacking the number on its
+/// own gauge keeps them reading as one unit at any value — a low
+/// percentage can't drift toward the neighboring module. Both rows
+/// share one fixed width (sized to "100%"), digits right-aligned, so
+/// nothing moves as values change. The fill shifts to the destructive
+/// accent past the module's `hot` threshold (percent).
 fn gauge_module(svg: &SvgIcon, frac: f32, hot: u32, palette: &Palette, label: Option<&str>) -> El {
     let fill = if frac * 100.0 >= hot as f32 {
         palette.destructive
     } else {
         palette.primary
     };
+    let width = 3.0 * *DIGIT_W_CAPTION + *PCT_GLYPH_W;
+    let gauge = column([
+        tabular(&format!("{:>3.0}%", frac * 100.0), *DIGIT_W_CAPTION, &|s| {
+            text(s).caption().muted()
+        }),
+        progress(frac, fill).height(Size::Fixed(4.0)),
+    ])
+    .width(Size::Fixed(width))
+    .gap(3.0);
+
     let mut items = vec![icon(svg.clone())];
     if let Some(label) = label {
         items.push(text(label.to_string()).caption().muted());
     }
-    items.push(
-        progress(frac, fill)
-            .width(Size::Fixed(42.0))
-            .height(Size::Fixed(5.0)),
-    );
-    items.push(tabular(
-        &format!("{:>3.0}%", frac * 100.0),
-        *DIGIT_W_CAPTION,
-        &|s| text(s).caption().muted(),
-    ));
+    items.push(gauge);
     row(items).gap(tokens::SPACE_1).align(Align::Center)
 }
 
