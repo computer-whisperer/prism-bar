@@ -5,11 +5,13 @@
 //! Modules degrade by absence: no workspaces → no pills, no focused
 //! window → no title.
 
+use std::rc::Rc;
 use std::sync::LazyLock;
 
 use damascene_core::prelude::*;
 use damascene_core::SvgIcon;
 
+use crate::config::Module;
 use crate::sysmon::SysStats;
 use crate::workspaces::WorkspaceView;
 
@@ -33,7 +35,10 @@ static ICON_DISK: LazyLock<SvgIcon> = LazyLock::new(|| {
 const TITLE_MAX_CHARS: usize = 80;
 
 pub struct BarApp {
-    clock: String,
+    /// Right-cluster modules in display order (from config).
+    modules: Rc<Vec<Module>>,
+    /// Formatted text per Clock module, in module order.
+    clocks: Vec<String>,
     workspaces: Vec<WorkspaceView>,
     title: Option<String>,
     sys: SysStats,
@@ -42,9 +47,10 @@ pub struct BarApp {
 }
 
 impl BarApp {
-    pub fn new() -> Self {
+    pub fn new(modules: Rc<Vec<Module>>) -> Self {
         Self {
-            clock: String::new(),
+            modules,
+            clocks: Vec::new(),
             workspaces: Vec::new(),
             title: None,
             sys: SysStats::default(),
@@ -72,7 +78,16 @@ impl BarApp {
 
 impl App for BarApp {
     fn before_build(&mut self) {
-        self.clock = chrono::Local::now().format("%H:%M:%S").to_string();
+        let now = chrono::Local::now();
+        self.clocks = self
+            .modules
+            .iter()
+            .filter_map(|m| match m {
+                // Formats are validated at config load.
+                Module::Clock(c) => Some(now.format(&c.format).to_string()),
+                _ => None,
+            })
+            .collect();
     }
 
     fn build(&self, cx: &BuildCx) -> El {
@@ -107,16 +122,40 @@ impl App for BarApp {
             items.push(title);
         }
         items.push(spacer());
-        for (svg, frac) in [
-            (&ICON_CPU, self.sys.cpu),
-            (&ICON_MEM, self.sys.mem),
-            (&ICON_DISK, self.sys.disk),
-        ] {
-            if let Some(frac) = frac {
-                items.push(gauge_module(svg, frac, palette));
+        let mut clock_i = 0;
+        for module in self.modules.iter() {
+            match module {
+                Module::Cpu(o) => {
+                    if let Some(frac) = self.sys.cpu {
+                        items.push(gauge_module(&ICON_CPU, frac, o.hot, palette, None));
+                    }
+                }
+                Module::Memory(o) => {
+                    if let Some(frac) = self.sys.mem {
+                        items.push(gauge_module(&ICON_MEM, frac, o.hot, palette, None));
+                    }
+                }
+                Module::Disk(o) => {
+                    let frac = self
+                        .sys
+                        .disks
+                        .iter()
+                        .find(|(p, _)| p == &o.path)
+                        .and_then(|(_, f)| *f);
+                    if let Some(frac) = frac {
+                        // Label non-root mounts so two disk gauges read.
+                        let label = (o.path != "/").then_some(o.path.as_str());
+                        items.push(gauge_module(&ICON_DISK, frac, o.hot, palette, label));
+                    }
+                }
+                Module::Clock(_) => {
+                    if let Some(clock) = self.clocks.get(clock_i) {
+                        items.push(tabular(clock, *DIGIT_W_LABEL, &|s| text(s).label()));
+                    }
+                    clock_i += 1;
+                }
             }
         }
-        items.push(tabular(&self.clock, *DIGIT_W_LABEL, &|s| text(s).label()));
 
         // The wl_surface is cleared transparent; the visible bar is this
         // rounded translucent panel, floated off the screen edge by the
@@ -180,24 +219,28 @@ fn tabular(s: &str, digit_w: f32, mk: &dyn Fn(String) -> El) -> El {
 }
 
 /// icon + mini gauge + percentage. The gauge fill shifts to the
-/// destructive accent as the resource runs hot.
-fn gauge_module(svg: &SvgIcon, frac: f32, palette: &Palette) -> El {
-    let fill = if frac >= 0.90 {
+/// destructive accent past the module's `hot` threshold (percent).
+fn gauge_module(svg: &SvgIcon, frac: f32, hot: u32, palette: &Palette, label: Option<&str>) -> El {
+    let fill = if frac * 100.0 >= hot as f32 {
         palette.destructive
     } else {
         palette.primary
     };
-    row([
-        icon(svg.clone()),
+    let mut items = vec![icon(svg.clone())];
+    if let Some(label) = label {
+        items.push(text(label.to_string()).caption().muted());
+    }
+    items.push(
         progress(frac, fill)
             .width(Size::Fixed(42.0))
             .height(Size::Fixed(5.0)),
-        tabular(&format!("{:>3.0}%", frac * 100.0), *DIGIT_W_CAPTION, &|s| {
-            text(s).caption().muted()
-        }),
-    ])
-    .gap(tokens::SPACE_1)
-    .align(Align::Center)
+    );
+    items.push(tabular(
+        &format!("{:>3.0}%", frac * 100.0),
+        *DIGIT_W_CAPTION,
+        &|s| text(s).caption().muted(),
+    ));
+    row(items).gap(tokens::SPACE_1).align(Align::Center)
 }
 
 /// `abc…xyz` truncation that keeps both ends of long titles readable.

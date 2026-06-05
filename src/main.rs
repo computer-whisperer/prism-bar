@@ -18,6 +18,7 @@ mod ui;
 mod workspaces;
 
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -49,7 +50,7 @@ use damascene_core::prelude::{App, Rect};
 use damascene_core::BuildCx;
 use damascene_wgpu::{MsaaTarget, Runner, RunnerCaps};
 
-use crate::config::{Config, Position};
+use crate::config::{Config, Module, Position};
 use crate::sysmon::SysMon;
 use crate::toplevels::ToplevelsState;
 use crate::ui::BarApp;
@@ -66,6 +67,8 @@ fn main() -> Result<()> {
         .init();
 
     let config = Config::load()?;
+    let modules = Rc::new(config.modules());
+    let has_clock = modules.iter().any(|m| matches!(m, Module::Clock(_)));
 
     let conn = Connection::connect_to_env().context("connect to wayland")?;
     let (globals, event_queue) = registry_queue_init::<Bar>(&conn).context("registry init")?;
@@ -85,7 +88,8 @@ fn main() -> Result<()> {
         gpu: None,
         surfaces: Vec::new(),
         pointer: None,
-        sysmon: SysMon::new(),
+        sysmon: SysMon::new(&modules),
+        modules,
         dirty: false,
         last_clock_secs: 0,
         exit: false,
@@ -102,9 +106,15 @@ fn main() -> Result<()> {
         // Sleep until the earliest deadline: damascene animation on any
         // surface, or the clock's next second. Wayland events interrupt.
         let now = Instant::now();
-        let clock_in =
-            Duration::from_millis(1000 - chrono::Local::now().timestamp_subsec_millis() as u64);
-        let mut timeout = clock_in.min(bar.sysmon.next_sample.saturating_duration_since(now));
+        let mut timeout = Duration::from_secs(3600);
+        if has_clock {
+            timeout = Duration::from_millis(
+                1000 - chrono::Local::now().timestamp_subsec_millis() as u64,
+            );
+        }
+        if bar.sysmon.active() {
+            timeout = timeout.min(bar.sysmon.next_sample.saturating_duration_since(now));
+        }
         for s in &bar.surfaces {
             if let Some(d) = s.anim_deadline {
                 timeout = timeout.min(d.saturating_duration_since(now));
@@ -124,14 +134,17 @@ fn main() -> Result<()> {
         }
         // Clock tick: redraw when the displayed second changes.
         let secs = chrono::Local::now().timestamp();
-        if secs != bar.last_clock_secs {
+        if has_clock && secs != bar.last_clock_secs {
             bar.last_clock_secs = secs;
             for s in &mut bar.surfaces {
                 s.dirty = true;
             }
         }
         // System monitor resample.
-        if Instant::now() >= bar.sysmon.next_sample && bar.sysmon.sample() {
+        if bar.sysmon.active()
+            && Instant::now() >= bar.sysmon.next_sample
+            && bar.sysmon.sample()
+        {
             for s in &mut bar.surfaces {
                 s.dirty = true;
             }
@@ -207,6 +220,8 @@ struct Bar {
     surfaces: Vec<BarSurface>,
     pointer: Option<wl_pointer::WlPointer>,
     sysmon: SysMon,
+    /// Right-cluster module specs shared with every BarApp.
+    modules: Rc<Vec<Module>>,
     /// Global-state redraw flag (protocol events); fanned out to every
     /// surface's `dirty` in the main loop.
     dirty: bool,
@@ -291,7 +306,7 @@ impl Bar {
             layer,
             output,
             output_name: name,
-            app: BarApp::new(),
+            app: BarApp::new(self.modules.clone()),
             width: 0,
             height,
             scale: 1,
@@ -416,7 +431,7 @@ impl Bar {
         let scale = s.scale as f32;
         let viewport = Rect::new(0.0, 0.0, s.width as f32, s.height as f32);
 
-        s.app.set_state(ws, title, self.sysmon.stats);
+        s.app.set_state(ws, title, self.sysmon.stats.clone());
         s.app.before_build();
         let theme = s.app.theme();
         let mut tree = {

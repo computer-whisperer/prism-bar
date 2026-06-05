@@ -1,24 +1,31 @@
 //! System monitor sampling — CPU, memory, disk.
 //!
 //! All sources are cheap synchronous reads (`/proc/stat`,
-//! `/proc/meminfo`, one `statvfs`), so sampling happens inline on the
-//! main loop's poll deadline; no thread.
+//! `/proc/meminfo`, one `statvfs` per configured mount), so sampling
+//! happens inline on the main loop's poll deadline; no thread. Only
+//! sources a configured module actually displays are read.
 
 use std::time::{Duration, Instant};
+
+use crate::config::Module;
 
 /// How often to resample.
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// One render-ready reading. Fractions are `0.0..=1.0`.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SysStats {
     /// None until two /proc/stat samples exist (CPU load is a delta).
     pub cpu: Option<f32>,
     pub mem: Option<f32>,
-    pub disk: Option<f32>,
+    /// Used fraction per configured mount path, in config order.
+    pub disks: Vec<(String, Option<f32>)>,
 }
 
 pub struct SysMon {
+    want_cpu: bool,
+    want_mem: bool,
+    disk_paths: Vec<String>,
     /// (busy, total) jiffies from the previous /proc/stat read.
     prev_cpu: Option<(u64, u64)>,
     pub stats: SysStats,
@@ -26,8 +33,20 @@ pub struct SysMon {
 }
 
 impl SysMon {
-    pub fn new() -> Self {
+    /// Sampler scoped to what the configured modules display.
+    pub fn new(modules: &[Module]) -> Self {
+        let mut disk_paths: Vec<String> = Vec::new();
+        for m in modules {
+            if let Module::Disk(d) = m {
+                if !disk_paths.contains(&d.path) {
+                    disk_paths.push(d.path.clone());
+                }
+            }
+        }
         let mut mon = Self {
+            want_cpu: modules.iter().any(|m| matches!(m, Module::Cpu(_))),
+            want_mem: modules.iter().any(|m| matches!(m, Module::Memory(_))),
+            disk_paths,
             prev_cpu: None,
             stats: SysStats::default(),
             next_sample: Instant::now(),
@@ -36,14 +55,24 @@ impl SysMon {
         mon
     }
 
+    /// Whether any sampling is configured at all (drives the loop's
+    /// poll deadline).
+    pub fn active(&self) -> bool {
+        self.want_cpu || self.want_mem || !self.disk_paths.is_empty()
+    }
+
     /// Take a fresh reading and arm the next deadline. Returns true if
     /// the rendered stats changed.
     pub fn sample(&mut self) -> bool {
         self.next_sample = Instant::now() + SAMPLE_INTERVAL;
         let new = SysStats {
-            cpu: self.sample_cpu(),
-            mem: sample_mem(),
-            disk: sample_disk(),
+            cpu: self.want_cpu.then(|| self.sample_cpu()).flatten(),
+            mem: self.want_mem.then(sample_mem).flatten(),
+            disks: self
+                .disk_paths
+                .iter()
+                .map(|p| (p.clone(), sample_disk(p)))
+                .collect(),
         };
         let changed = new != self.stats;
         self.stats = new;
@@ -95,8 +124,8 @@ fn sample_mem() -> Option<f32> {
     Some(1.0 - available as f32 / total as f32)
 }
 
-fn sample_disk() -> Option<f32> {
-    let vfs = rustix::fs::statvfs("/").ok()?;
+fn sample_disk(path: &str) -> Option<f32> {
+    let vfs = rustix::fs::statvfs(path).ok()?;
     if vfs.f_blocks == 0 {
         return None;
     }
