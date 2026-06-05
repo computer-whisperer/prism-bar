@@ -1,0 +1,34 @@
+[package]
+name = "prism-bar"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+description = "Status bar for the prism compositor — damascene-rendered, layer-shell native"
+authors = ["Christian Balcom"]
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# wayland client stack — same harness as prism-bg: SCTK covers
+# registry/output/seat/layer-shell boilerplate, calloop drives the loop.
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+wayland-client = "0.31"
+# The system libwayland backend is required: wgpu's Vulkan WSI takes raw
+# `wl_display`/`wl_surface` pointers, which the pure-Rust backend can't give.
+wayland-backend = { version = "0.3", features = ["client_system"] }
+
+# UI toolkit. The winit host is bypassed: we own the layer surface and
+# event loop, and drive the wgpu Runner directly (custom-host path).
+damascene-core = { path = "../damascene/damascene.main/crates/damascene-core" }
+damascene-wgpu = { path = "../damascene/damascene.main/crates/damascene-wgpu" }
+
+# GPU surface on the layer surface's wl_surface via raw handles.
+wgpu = "29"
+raw-window-handle = "0.6"
+pollster = "0.4"
+
+# Local time for the clock module.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
