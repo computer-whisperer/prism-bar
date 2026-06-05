@@ -116,7 +116,9 @@ impl App for BarApp {
                 items.push(gauge_module(svg, frac, palette));
             }
         }
-        items.push(text(self.clock.clone()).label());
+        // Monospace digits: every glyph has the same advance, so the
+        // ticking clock never reflows the row.
+        items.push(mono(self.clock.clone()).label());
 
         // The wl_surface is cleared transparent; the visible bar is this
         // rounded translucent panel, floated off the screen edge by the
@@ -153,7 +155,9 @@ fn gauge_module(svg: &SvgIcon, frac: f32, palette: &Palette) -> El {
         progress(frac, fill)
             .width(Size::Fixed(42.0))
             .height(Size::Fixed(5.0)),
-        text(format!("{:>3.0}%", frac * 100.0)).caption().muted(),
+        // Monospace + space-padded to 3 digits: "  4%" and "100%" are
+        // the same width, so value changes never shift the layout.
+        mono(format!("{:>3.0}%", frac * 100.0)).caption().muted(),
     ])
     .gap(tokens::SPACE_1)
     .align(Align::Center)
