@@ -42,3 +42,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # KDL config, same stack as prism-config (knuffel + miette diagnostics).
 knuffel = "3.2.0"
 miette = { version = "5.10.0", features = ["fancy-no-backtrace"] }
+
+# statvfs for the disk module.
+rustix = { version = "1", features = ["fs"] }

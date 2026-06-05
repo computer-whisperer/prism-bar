@@ -5,9 +5,28 @@
 //! Modules degrade by absence: no workspaces → no pills, no focused
 //! window → no title.
 
-use damascene_core::prelude::*;
+use std::sync::LazyLock;
 
+use damascene_core::prelude::*;
+use damascene_core::SvgIcon;
+
+use crate::sysmon::SysStats;
 use crate::workspaces::WorkspaceView;
+
+// Vendored lucide glyphs (ISC license) — the built-in icon set has no
+// hardware vocabulary. `parse_current_color` makes them tint like the
+// built-ins.
+static ICON_CPU: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse_current_color(include_str!("../assets/icons/cpu.svg")).expect("cpu.svg")
+});
+static ICON_MEM: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse_current_color(include_str!("../assets/icons/memory-stick.svg"))
+        .expect("memory-stick.svg")
+});
+static ICON_DISK: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse_current_color(include_str!("../assets/icons/hard-drive.svg"))
+        .expect("hard-drive.svg")
+});
 
 /// Longest title before middle-truncation; keeps the title from
 /// crowding the clock until proper width-constrained truncation.
@@ -17,6 +36,7 @@ pub struct BarApp {
     clock: String,
     workspaces: Vec<WorkspaceView>,
     title: Option<String>,
+    sys: SysStats,
     /// Workspace slot the user clicked, drained by the host.
     pending_activate: Option<usize>,
 }
@@ -27,14 +47,21 @@ impl BarApp {
             clock: String::new(),
             workspaces: Vec::new(),
             title: None,
+            sys: SysStats::default(),
             pending_activate: None,
         }
     }
 
     /// Host-side state push, called before each build.
-    pub fn set_state(&mut self, workspaces: Vec<WorkspaceView>, title: Option<String>) {
+    pub fn set_state(
+        &mut self,
+        workspaces: Vec<WorkspaceView>,
+        title: Option<String>,
+        sys: SysStats,
+    ) {
         self.workspaces = workspaces;
         self.title = title;
+        self.sys = sys;
     }
 
     /// Drain the workspace-switch request from the last event batch.
@@ -80,6 +107,15 @@ impl App for BarApp {
             items.push(title);
         }
         items.push(spacer());
+        for (svg, frac) in [
+            (&ICON_CPU, self.sys.cpu),
+            (&ICON_MEM, self.sys.mem),
+            (&ICON_DISK, self.sys.disk),
+        ] {
+            if let Some(frac) = frac {
+                items.push(gauge_module(svg, frac, palette));
+            }
+        }
         items.push(text(self.clock.clone()).label());
 
         // The wl_surface is cleared transparent; the visible bar is this
@@ -102,6 +138,25 @@ impl App for BarApp {
             }
         }
     }
+}
+
+/// icon + mini gauge + percentage. The gauge fill shifts to the
+/// destructive accent as the resource runs hot.
+fn gauge_module(svg: &SvgIcon, frac: f32, palette: &Palette) -> El {
+    let fill = if frac >= 0.90 {
+        palette.destructive
+    } else {
+        palette.primary
+    };
+    row([
+        icon(svg.clone()),
+        progress(frac, fill)
+            .width(Size::Fixed(42.0))
+            .height(Size::Fixed(5.0)),
+        text(format!("{:>3.0}%", frac * 100.0)).caption().muted(),
+    ])
+    .gap(tokens::SPACE_1)
+    .align(Align::Center)
 }
 
 /// `abc…xyz` truncation that keeps both ends of long titles readable.

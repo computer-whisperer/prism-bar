@@ -12,6 +12,7 @@
 //!   SCTK pointer events → routed by wl_surface → runner.pointer_*()
 
 mod config;
+mod sysmon;
 mod toplevels;
 mod ui;
 mod workspaces;
@@ -49,6 +50,7 @@ use damascene_core::BuildCx;
 use damascene_wgpu::{MsaaTarget, Runner, RunnerCaps};
 
 use crate::config::{Config, Position};
+use crate::sysmon::SysMon;
 use crate::toplevels::ToplevelsState;
 use crate::ui::BarApp;
 use crate::workspaces::WorkspacesState;
@@ -83,6 +85,7 @@ fn main() -> Result<()> {
         gpu: None,
         surfaces: Vec::new(),
         pointer: None,
+        sysmon: SysMon::new(),
         dirty: false,
         last_clock_secs: 0,
         exit: false,
@@ -101,7 +104,7 @@ fn main() -> Result<()> {
         let now = Instant::now();
         let clock_in =
             Duration::from_millis(1000 - chrono::Local::now().timestamp_subsec_millis() as u64);
-        let mut timeout = clock_in;
+        let mut timeout = clock_in.min(bar.sysmon.next_sample.saturating_duration_since(now));
         for s in &bar.surfaces {
             if let Some(d) = s.anim_deadline {
                 timeout = timeout.min(d.saturating_duration_since(now));
@@ -123,6 +126,12 @@ fn main() -> Result<()> {
         let secs = chrono::Local::now().timestamp();
         if secs != bar.last_clock_secs {
             bar.last_clock_secs = secs;
+            for s in &mut bar.surfaces {
+                s.dirty = true;
+            }
+        }
+        // System monitor resample.
+        if Instant::now() >= bar.sysmon.next_sample && bar.sysmon.sample() {
             for s in &mut bar.surfaces {
                 s.dirty = true;
             }
@@ -197,6 +206,7 @@ struct Bar {
     gpu: Option<GpuShared>,
     surfaces: Vec<BarSurface>,
     pointer: Option<wl_pointer::WlPointer>,
+    sysmon: SysMon,
     /// Global-state redraw flag (protocol events); fanned out to every
     /// surface's `dirty` in the main loop.
     dirty: bool,
@@ -406,7 +416,7 @@ impl Bar {
         let scale = s.scale as f32;
         let viewport = Rect::new(0.0, 0.0, s.width as f32, s.height as f32);
 
-        s.app.set_state(ws, title);
+        s.app.set_state(ws, title, self.sysmon.stats);
         s.app.before_build();
         let theme = s.app.theme();
         let mut tree = {
