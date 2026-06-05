@@ -27,7 +27,8 @@ use raw_window_handle::{
 };
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
-use smithay_client_toolkit::reexports::calloop::EventLoop;
+use smithay_client_toolkit::reexports::calloop::generic::Generic;
+use smithay_client_toolkit::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
@@ -68,7 +69,6 @@ fn main() -> Result<()> {
 
     let config = Config::load()?;
     let modules = Rc::new(config.modules());
-    let has_clock = modules.iter().any(|m| matches!(m, Module::Clock(_)));
 
     let conn = Connection::connect_to_env().context("connect to wayland")?;
     let (globals, event_queue) = registry_queue_init::<Bar>(&conn).context("registry init")?;
@@ -89,7 +89,9 @@ fn main() -> Result<()> {
         surfaces: Vec::new(),
         pointer: None,
         sysmon: SysMon::new(&modules),
+        has_clock: modules.iter().any(|m| matches!(m, Module::Clock(_))),
         modules,
+        reload_at: None,
         dirty: false,
         last_clock_secs: 0,
         exit: false,
@@ -99,6 +101,7 @@ fn main() -> Result<()> {
     WaylandSource::new(conn, event_queue)
         .insert(event_loop.handle())
         .map_err(|e| anyhow::anyhow!("insert wayland source: {e}"))?;
+    watch_config(&mut event_loop)?;
 
     // Surfaces are created by `new_output` as outputs are announced
     // (the same path handles initial enumeration and later hotplug).
@@ -107,13 +110,16 @@ fn main() -> Result<()> {
         // surface, or the clock's next second. Wayland events interrupt.
         let now = Instant::now();
         let mut timeout = Duration::from_secs(3600);
-        if has_clock {
-            timeout = Duration::from_millis(
+        if bar.has_clock {
+            timeout = timeout.min(Duration::from_millis(
                 1000 - chrono::Local::now().timestamp_subsec_millis() as u64,
-            );
+            ));
         }
         if bar.sysmon.active() {
             timeout = timeout.min(bar.sysmon.next_sample.saturating_duration_since(now));
+        }
+        if let Some(d) = bar.reload_at {
+            timeout = timeout.min(d.saturating_duration_since(now));
         }
         for s in &bar.surfaces {
             if let Some(d) = s.anim_deadline {
@@ -132,9 +138,14 @@ fn main() -> Result<()> {
                 s.dirty = true;
             }
         }
+        // Debounced config reload (armed by the inotify source).
+        if bar.reload_at.is_some_and(|d| d <= Instant::now()) {
+            bar.reload_at = None;
+            bar.reload_config(&qh);
+        }
         // Clock tick: redraw when the displayed second changes.
         let secs = chrono::Local::now().timestamp();
-        if has_clock && secs != bar.last_clock_secs {
+        if bar.has_clock && secs != bar.last_clock_secs {
             bar.last_clock_secs = secs;
             for s in &mut bar.surfaces {
                 s.dirty = true;
@@ -222,6 +233,9 @@ struct Bar {
     sysmon: SysMon,
     /// Right-cluster module specs shared with every BarApp.
     modules: Rc<Vec<Module>>,
+    has_clock: bool,
+    /// Debounced config-reload deadline (armed by the inotify source).
+    reload_at: Option<Instant>,
     /// Global-state redraw flag (protocol events); fanned out to every
     /// surface's `dirty` in the main loop.
     dirty: bool,
@@ -231,19 +245,12 @@ struct Bar {
 }
 
 impl Bar {
-    fn create_bar(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput, name: String) {
-        tracing::info!(output = %name, "creating bar");
-        let surface = self.compositor.create_surface(qh);
-        let layer = self.layer_shell.create_layer_surface(
-            qh,
-            surface,
-            Layer::Top,
-            Some("prism-bar"),
-            Some(&output),
-        );
-        let height = self.config.height;
-        let margin = self.config.margin;
-        match self.config.position {
+    /// Push the config's geometry onto a layer surface (used at
+    /// creation and on live reload). The caller commits.
+    fn apply_layer_geometry(config: &Config, layer: &LayerSurface) {
+        let height = config.height;
+        let margin = config.margin;
+        match config.position {
             Position::Top => {
                 layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
                 layer.set_margin(margin, margin, 0, margin);
@@ -256,6 +263,19 @@ impl Bar {
         layer.set_size(0, height);
         // The compositor adds the anchored-edge margin to the zone.
         layer.set_exclusive_zone(height as i32);
+    }
+
+    fn create_bar(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput, name: String) {
+        tracing::info!(output = %name, "creating bar");
+        let surface = self.compositor.create_surface(qh);
+        let layer = self.layer_shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Top,
+            Some("prism-bar"),
+            Some(&output),
+        );
+        Self::apply_layer_geometry(&self.config, &layer);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.commit();
 
@@ -308,12 +328,58 @@ impl Bar {
             output_name: name,
             app: BarApp::new(self.modules.clone()),
             width: 0,
-            height,
+            height: self.config.height,
             scale: 1,
             dirty: false,
             anim_deadline: None,
             pointer_pos: (0.0, 0.0),
         });
+    }
+
+    /// Reload the config file and apply the differences live. A file
+    /// that fails to load keeps the running config.
+    fn reload_config(&mut self, qh: &QueueHandle<Self>) {
+        let new = match Config::load() {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::error!("config reload failed; keeping current config\n{err:#}");
+                return;
+            }
+        };
+        tracing::info!("config reloaded");
+        self.config = new;
+        self.modules = Rc::new(self.config.modules());
+        self.has_clock = self.modules.iter().any(|m| matches!(m, Module::Clock(_)));
+        self.sysmon = SysMon::new(&self.modules);
+
+        // Drop bars on outputs the new config no longer wants.
+        self.surfaces.retain(|s| {
+            let keep = self.config.wants_output(&s.output_name);
+            if !keep {
+                tracing::info!(output = %s.output_name, "bar removed by config");
+            }
+            keep
+        });
+        // Re-apply geometry + modules to surviving bars.
+        for s in &mut self.surfaces {
+            Self::apply_layer_geometry(&self.config, &s.layer);
+            s.layer.commit();
+            s.height = self.config.height;
+            s.app = BarApp::new(self.modules.clone());
+            s.dirty = true;
+        }
+        // Create bars on newly wanted outputs.
+        let outputs: Vec<_> = self.output_state.outputs().collect();
+        for output in outputs {
+            let Some(name) = self.output_state.info(&output).and_then(|i| i.name) else {
+                continue;
+            };
+            if self.config.wants_output(&name)
+                && !self.surfaces.iter().any(|s| s.output == output)
+            {
+                self.create_bar(qh, output, name);
+            }
+        }
     }
 
     /// Configure (or reconfigure) the swapchain for surface `i` from its
@@ -746,6 +812,62 @@ impl PointerHandler for Bar {
             }
         }
     }
+}
+
+/// Watch the config file's parent directory for changes to the file
+/// and arm `Bar::reload_at` (debounced — editors emit event bursts,
+/// and rename-replace saves never touch the watched fd of the file
+/// itself, hence the directory watch). No config directory yet means
+/// live reload stays inactive for this run.
+fn watch_config(event_loop: &mut EventLoop<Bar>) -> Result<()> {
+    use rustix::fs::inotify;
+
+    let Some(path) = Config::path() else {
+        return Ok(());
+    };
+    let (Some(dir), Some(file_name)) = (path.parent(), path.file_name()) else {
+        return Ok(());
+    };
+    if !dir.is_dir() {
+        tracing::info!("{} absent; live config reload inactive", dir.display());
+        return Ok(());
+    }
+    let file_name = file_name.to_owned();
+
+    let fd = inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC)
+        .context("inotify init")?;
+    inotify::add_watch(
+        &fd,
+        dir,
+        inotify::WatchFlags::CLOSE_WRITE
+            | inotify::WatchFlags::MOVED_TO
+            | inotify::WatchFlags::CREATE
+            | inotify::WatchFlags::DELETE,
+    )
+    .context("inotify add_watch")?;
+    tracing::debug!("watching {} for config changes", dir.display());
+
+    event_loop
+        .handle()
+        .insert_source(
+            Generic::new(fd, Interest::READ, Mode::Level),
+            move |_, fd, bar: &mut Bar| {
+                let mut buf = [std::mem::MaybeUninit::uninit(); 1024];
+                let mut reader = inotify::Reader::new(fd, &mut buf);
+                while let Ok(event) = reader.next() {
+                    let matches = event
+                        .file_name()
+                        .map(|n| n.to_bytes() == file_name.as_encoded_bytes())
+                        .unwrap_or(false);
+                    if matches {
+                        bar.reload_at = Some(Instant::now() + Duration::from_millis(150));
+                    }
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("insert inotify source: {e}"))?;
+    Ok(())
 }
 
 fn linux_button(code: u32) -> Option<PointerButton> {
