@@ -5,6 +5,9 @@
 // a missing file or omitted node means the built-in default. A file
 // that fails to parse is an error — prism-bar will not silently fall
 // back to defaults over a typo.
+//
+// Edits apply live: saving this file reconfigures running bars. A save
+// that fails to parse logs the error and keeps the current config.
 
 // Which outputs (connector names) get a bar. Repeat the node per
 // output. Omitting every `output` node puts a bar on all outputs,
