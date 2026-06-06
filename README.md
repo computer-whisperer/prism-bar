@@ -62,6 +62,9 @@ pinning, `sample-interval`, and the `modules` block.
 cargo build --release
 ```
 
+An AUR-oriented `PKGBUILD` is provided for tagged releases. It installs the
+binary, this README, and the license files.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
