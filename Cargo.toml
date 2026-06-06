@@ -3,8 +3,9 @@ name = "prism-bar"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-license = "GPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 description = "Status bar for the prism compositor — damascene-rendered, layer-shell native"
+repository = "https://github.com/computer-whisperer/prism-bar"
 authors = ["Christian Balcom"]
 
 [dependencies]
