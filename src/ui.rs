@@ -13,6 +13,7 @@ use damascene_core::SvgIcon;
 
 use crate::config::{Appearance, Module, ThemeName};
 use crate::sysmon::SysStats;
+use crate::tray::{Address, TrayCmd, TrayIcon, TrayItem};
 use crate::workspaces::WorkspaceView;
 
 // Vendored lucide glyphs (ISC license) — the built-in icon set has no
@@ -30,6 +31,15 @@ static ICON_DISK: LazyLock<SvgIcon> = LazyLock::new(|| {
         .expect("hard-drive.svg")
 });
 
+/// A tray interaction the host must perform (it owns the D-Bus side).
+pub enum TrayAction {
+    /// Forward to the tray thread as-is.
+    Cmd(TrayCmd),
+    /// Open the item's menu: fetch the layout and pop a menu surface
+    /// anchored at the icon's laid-out rect (bar surface coordinates).
+    OpenMenu { address: Address, anchor: Rect },
+}
+
 pub struct BarApp {
     /// Right-cluster modules in display order (from config).
     modules: Rc<Vec<Module>>,
@@ -39,8 +49,11 @@ pub struct BarApp {
     workspaces: Vec<WorkspaceView>,
     title: Option<String>,
     sys: SysStats,
+    tray: Vec<TrayItem>,
     /// Workspace slot the user clicked, drained by the host.
     pending_activate: Option<usize>,
+    /// Tray interaction from the last event batch, drained by the host.
+    pending_tray: Option<TrayAction>,
 }
 
 impl BarApp {
@@ -52,7 +65,9 @@ impl BarApp {
             workspaces: Vec::new(),
             title: None,
             sys: SysStats::default(),
+            tray: Vec::new(),
             pending_activate: None,
+            pending_tray: None,
         }
     }
 
@@ -62,15 +77,22 @@ impl BarApp {
         workspaces: Vec<WorkspaceView>,
         title: Option<String>,
         sys: SysStats,
+        tray: Vec<TrayItem>,
     ) {
         self.workspaces = workspaces;
         self.title = title;
         self.sys = sys;
+        self.tray = tray;
     }
 
     /// Drain the workspace-switch request from the last event batch.
     pub fn take_activate(&mut self) -> Option<usize> {
         self.pending_activate.take()
+    }
+
+    /// Drain the tray interaction from the last event batch.
+    pub fn take_tray_action(&mut self) -> Option<TrayAction> {
+        self.pending_tray.take()
     }
 }
 
@@ -139,6 +161,17 @@ impl App for BarApp {
         let mut clock_i = 0;
         for module in self.modules.iter() {
             match module {
+                Module::Tray(o) => {
+                    if !self.tray.is_empty() {
+                        let icons: Vec<El> = self
+                            .tray
+                            .iter()
+                            .enumerate()
+                            .map(|(i, item)| tray_icon(i, item, o.icon_size as f32))
+                            .collect();
+                        right.push(row(icons).gap(tokens::SPACE_2).align(Align::Center));
+                    }
+                }
                 Module::Cpu(o) => {
                     if let Some(frac) = self.sys.cpu {
                         right.push(gauge_module(
@@ -218,6 +251,67 @@ impl App for BarApp {
                 self.pending_activate = Some(ws.slot);
             }
         }
+        for (i, item) in self.tray.iter().enumerate() {
+            if !event.is_route(&format!("tray-{i}")) {
+                continue;
+            }
+            let open_menu = || {
+                event.target_rect().map(|anchor| TrayAction::OpenMenu {
+                    address: item.address.clone(),
+                    anchor,
+                })
+            };
+            // SNI conventions: left = Activate (menu when the item asks
+            // for it), right = context menu, middle = SecondaryActivate.
+            self.pending_tray = match event.kind {
+                UiEventKind::Click | UiEventKind::Activate => {
+                    if item.item_is_menu && item.has_menu {
+                        open_menu()
+                    } else {
+                        Some(TrayAction::Cmd(TrayCmd::Activate(item.address.clone())))
+                    }
+                }
+                UiEventKind::SecondaryClick if item.has_menu => open_menu(),
+                UiEventKind::MiddleClick => Some(TrayAction::Cmd(TrayCmd::SecondaryActivate(
+                    item.address.clone(),
+                ))),
+                _ => None,
+            }
+            .or(self.pending_tray.take());
+        }
+    }
+}
+
+/// One tray icon as a keyed, clickable element. Items without a
+/// resolvable icon fall back to the title's first letter so they stay
+/// visible and clickable.
+fn tray_icon(i: usize, item: &TrayItem, size: f32) -> El {
+    let el = match &item.icon {
+        Some(TrayIcon::Raster(img)) => image(img.clone())
+            .image_fit(ImageFit::Contain)
+            .width(Size::Fixed(size))
+            .height(Size::Fixed(size)),
+        Some(TrayIcon::Svg(svg)) => icon(svg.clone()).icon_size(size),
+        None => row([text(
+            item.title
+                .chars()
+                .next()
+                .unwrap_or('?')
+                .to_uppercase()
+                .to_string(),
+        )
+        .label()
+        .muted()])
+        .width(Size::Fixed(size))
+        .height(Size::Fixed(size))
+        .justify(Justify::Center)
+        .align(Align::Center),
+    };
+    let el = el.key(format!("tray-{i}"));
+    if item.title.is_empty() {
+        el
+    } else {
+        el.tooltip(item.title.clone())
     }
 }
 

@@ -14,6 +14,7 @@
 mod config;
 mod sysmon;
 mod toplevels;
+mod tray;
 mod ui;
 mod workspaces;
 
@@ -27,6 +28,7 @@ use raw_window_handle::{
 };
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::reexports::calloop::channel as calloop_channel;
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
 use smithay_client_toolkit::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
@@ -54,7 +56,8 @@ use damascene_wgpu::{MsaaTarget, Runner, RunnerCaps};
 use crate::config::{Appearance, Config, Module, Position};
 use crate::sysmon::SysMon;
 use crate::toplevels::ToplevelsState;
-use crate::ui::BarApp;
+use crate::tray::{Tray, TrayEvent, TrayItem};
+use crate::ui::{BarApp, TrayAction};
 use crate::workspaces::WorkspacesState;
 
 const MSAA_SAMPLES: u32 = 4;
@@ -76,6 +79,10 @@ fn main() -> Result<()> {
     let (globals, event_queue) = registry_queue_init::<Bar>(&conn).context("registry init")?;
     let qh = event_queue.handle();
 
+    // Tray events flow over this channel for the life of the process;
+    // the tray thread itself starts/stops with the config (ensure_tray).
+    let (tray_send, tray_recv) = calloop_channel::channel();
+
     let mut bar = Bar {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -94,17 +101,29 @@ fn main() -> Result<()> {
         has_clock: modules.iter().any(|m| matches!(m, Module::Clock(_))),
         modules,
         appearance,
+        tray: None,
+        tray_send,
+        tray_items: Vec::new(),
         reload_at: None,
         dirty: false,
         last_clock_secs: 0,
         exit: false,
     };
+    bar.ensure_tray();
 
     let mut event_loop: EventLoop<Bar> = EventLoop::try_new().context("calloop")?;
     WaylandSource::new(conn, event_queue)
         .insert(event_loop.handle())
         .map_err(|e| anyhow::anyhow!("insert wayland source: {e}"))?;
     watch_config(&mut event_loop)?;
+    event_loop
+        .handle()
+        .insert_source(tray_recv, |event, _, bar: &mut Bar| {
+            if let calloop_channel::Event::Msg(event) = event {
+                bar.on_tray_event(event);
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("insert tray source: {e}"))?;
 
     // Surfaces are created by `new_output` as outputs are announced
     // (the same path handles initial enumeration and later hotplug).
@@ -234,6 +253,13 @@ struct Bar {
     /// Right-cluster module specs shared with every BarApp.
     modules: Rc<Vec<Module>>,
     appearance: Rc<Appearance>,
+    /// SNI host thread handle; present while the config has a tray
+    /// module. Dropping it shuts the thread down.
+    tray: Option<Tray>,
+    /// Event channel into the calloop (kept for tray restarts).
+    tray_send: calloop_channel::Sender<TrayEvent>,
+    /// Latest tray snapshot, fanned out to every BarApp per draw.
+    tray_items: Vec<TrayItem>,
     has_clock: bool,
     /// Debounced config-reload deadline (armed by the inotify source).
     reload_at: Option<Instant>,
@@ -337,6 +363,37 @@ impl Bar {
         });
     }
 
+    /// Start or stop the tray thread to match the configured modules.
+    fn ensure_tray(&mut self) {
+        let wanted = self.modules.iter().any(|m| matches!(m, Module::Tray(_)));
+        match (&self.tray, wanted) {
+            (None, true) => self.tray = Some(Tray::spawn(self.tray_send.clone())),
+            (Some(_), false) => {
+                self.tray = None;
+                self.tray_items.clear();
+            }
+            _ => {}
+        }
+    }
+
+    fn on_tray_event(&mut self, event: TrayEvent) {
+        match event {
+            TrayEvent::Items(items) => {
+                self.tray_items = items;
+                self.dirty = true;
+            }
+            // Menu surfaces land with the popup work; until then the
+            // reply is just logged so the D-Bus side can be exercised.
+            TrayEvent::Menu { address, root } => {
+                tracing::debug!(
+                    ?root,
+                    "menu layout for {address:?} (popup not implemented yet)"
+                );
+            }
+            TrayEvent::MenuError { .. } => {}
+        }
+    }
+
     /// Reload the config file and apply the differences live. A file
     /// that fails to load keeps the running config.
     fn reload_config(&mut self, qh: &QueueHandle<Self>) {
@@ -353,6 +410,7 @@ impl Bar {
         self.appearance = Rc::new(self.config.appearance());
         self.has_clock = self.modules.iter().any(|m| matches!(m, Module::Clock(_)));
         self.sysmon = SysMon::new(&self.modules, self.config.sample_interval);
+        self.ensure_tray();
 
         // Drop bars on outputs the new config no longer wants.
         self.surfaces.retain(|s| {
@@ -502,7 +560,12 @@ impl Bar {
         let scale = s.scale as f32;
         let viewport = Rect::new(0.0, 0.0, s.width as f32, s.height as f32);
 
-        s.app.set_state(ws, title, self.sysmon.stats.clone());
+        s.app.set_state(
+            ws,
+            title,
+            self.sysmon.stats.clone(),
+            self.tray_items.clone(),
+        );
         s.app.before_build();
         let theme = s.app.theme();
         let mut tree = {
@@ -582,6 +645,23 @@ impl Bar {
         // Side effects the app requested (it can't talk wayland itself).
         if let Some(slot) = s.app.take_activate() {
             self.workspaces.activate(slot);
+        }
+        if let Some(action) = s.app.take_tray_action() {
+            match action {
+                TrayAction::Cmd(cmd) => {
+                    if let Some(tray) = &self.tray {
+                        tray.send(cmd);
+                    }
+                }
+                TrayAction::OpenMenu { address, anchor } => {
+                    // The popup surface lands next; for now fetch the
+                    // layout so the dbusmenu path can be exercised.
+                    tracing::debug!(?anchor, "menu requested");
+                    if let Some(tray) = &self.tray {
+                        tray.send(crate::tray::TrayCmd::MenuOpen(address));
+                    }
+                }
+            }
         }
         self.surfaces[i].dirty = true;
     }

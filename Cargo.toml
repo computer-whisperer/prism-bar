@@ -46,3 +46,14 @@ miette = { version = "5.10.0", features = ["fancy-no-backtrace"] }
 
 # statvfs for the disk module.
 rustix = { version = "1", features = ["fs"] }
+
+# System tray (StatusNotifierItem host + com.canonical.dbusmenu) — same
+# zbus harness as prism-notify but inverted: we're the D-Bus *client*
+# consuming many item services, so the tray thread runs async zbus and
+# feeds the main calloop via a calloop channel; commands flow back over
+# an async-channel.
+zbus = "5"
+async-channel = "2"
+futures-util = { version = "0.3", default-features = false }
+# Icon-theme lookup decodes png files (svg goes through damascene).
+png = "0.17"

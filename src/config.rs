@@ -15,8 +15,9 @@
 //! position "top"   // "top" | "bottom"
 //!
 //! // Right-side modules in display order; presence enables. Omit the
-//! // block for the default set: cpu, memory, disk "/", clock.
+//! // block for the default set: tray, cpu, memory, disk "/", clock.
 //! modules {
+//!     tray icon-size=22    // StatusNotifierItem system tray
 //!     cpu hot=95           // hot= tints the gauge destructive at N%
 //!     memory
 //!     disk "/"             // repeatable, one gauge per path
@@ -122,6 +123,7 @@ struct Modules {
 /// One right-cluster module. Node name selects the variant.
 #[derive(Debug, Clone, PartialEq, knuffel::Decode)]
 pub enum Module {
+    Tray(TrayOpts),
     Cpu(GaugeOpts),
     Memory(GaugeOpts),
     Disk(DiskOpts),
@@ -152,6 +154,13 @@ pub struct DiskOpts {
     pub width: u32,
     #[knuffel(property, default = 5)]
     pub thickness: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, knuffel::Decode)]
+pub struct TrayOpts {
+    /// Icon edge length in logical pixels (KDL: `icon-size`).
+    #[knuffel(property, default = 22)]
+    pub icon_size: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, knuffel::Decode)]
@@ -220,6 +229,7 @@ impl Config {
         match &self.modules {
             Some(m) => m.list.clone(),
             None => vec![
+                Module::Tray(TrayOpts { icon_size: 22 }),
                 Module::Cpu(GAUGE),
                 Module::Memory(GAUGE),
                 Module::Disk(DiskOpts {
