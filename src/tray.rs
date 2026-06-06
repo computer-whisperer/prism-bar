@@ -254,6 +254,11 @@ struct ItemState {
     /// Spec: Passive items should be hidden.
     passive: bool,
     menu_path: Option<OwnedObjectPath>,
+    /// The item exports no `Activate` method (introspected once at
+    /// registration). libappindicator/ayatana items are menu-only but
+    /// don't always say so via `ItemIsMenu`; without this, left clicks
+    /// fire UnknownMethod errors instead of opening the menu.
+    no_activate: bool,
     /// Signal-watch task; dropping it (on removal) cancels the watch.
     _task: zbus::Task<()>,
 }
@@ -273,7 +278,13 @@ fn push_snapshot(state: &Shared) {
         .items
         .values()
         .filter(|i| !i.passive)
-        .map(|i| i.view.clone())
+        .map(|i| {
+            let mut view = i.view.clone();
+            // A menu-only item behaves as ItemIsMenu even when it
+            // doesn't set the property.
+            view.item_is_menu |= i.no_activate && view.has_menu;
+            view
+        })
         .collect();
     tracing::debug!(
         visible = items.len(),
@@ -396,6 +407,7 @@ async fn add_item(state: Shared, conn: Connection, address: Address, registered:
     };
     let (view, passive) = fetch_view(&proxy, &address).await;
     let menu_path = proxy.menu().await.ok().filter(|p| p.as_str() != "/");
+    let no_activate = item_lacks_activate(&conn, &address).await;
     let task = conn.executor().spawn(
         watch_item(state.clone(), proxy.clone(), address.clone()),
         "tray-item-signals",
@@ -417,11 +429,29 @@ async fn add_item(state: Shared, conn: Connection, address: Address, registered:
                 view,
                 passive,
                 menu_path,
+                no_activate,
                 _task: task,
             },
         );
     }
     push_snapshot(&state);
+}
+
+/// True when the item's introspection lacks an `Activate` method.
+/// Best-effort: an introspection failure counts as "has Activate" so
+/// we don't reroute clicks on flimsy evidence.
+async fn item_lacks_activate(conn: &Connection, address: &Address) -> bool {
+    let proxy = zbus::fdo::IntrospectableProxy::builder(conn)
+        .destination(address.bus.clone())
+        .and_then(|b| b.path(address.path.clone()))
+        .map(|b| b.build());
+    let Ok(proxy) = proxy else { return false };
+    let Ok(proxy) = proxy.await else { return false };
+    match proxy.introspect().await {
+        // Exact attribute match: must not catch SecondaryActivate.
+        Ok(xml) => !xml.contains("name=\"Activate\""),
+        Err(_) => false,
+    }
 }
 
 fn remove_item(state: &Shared, key: &str) -> Option<String> {
@@ -728,7 +758,6 @@ async fn handle_cmd(cmd: TrayCmd, state: &Shared, conn: &Connection, events: &Se
         }
         TrayCmd::MenuClicked { address, id } => {
             if let Ok(proxy) = menu_proxy(state, conn, &address).await {
-                let _ = proxy.about_to_show(id).await;
                 if let Err(err) = proxy.event(id, "clicked", &Value::I32(0), unix_now()).await {
                     tracing::debug!(item = %address.key(), %err, "menu click failed");
                 }
