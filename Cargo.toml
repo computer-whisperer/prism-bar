@@ -29,8 +29,8 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 # UI toolkit. The winit host is bypassed: we own the layer surface and
 # event loop, and drive the wgpu Runner directly (custom-host path).
-damascene-core = { path = "../damascene/damascene.main/crates/damascene-core" }
-damascene-wgpu = { path = "../damascene/damascene.main/crates/damascene-wgpu" }
+damascene-core = "0.4.1"
+damascene-wgpu = "0.4.1"
 
 # GPU surface on the layer surface's wl_surface via raw handles.
 wgpu = "29"

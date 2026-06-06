@@ -568,8 +568,15 @@ impl Bar {
             return;
         }
         let s = &mut self.surfaces[i];
+        // Geometry queries answer from the runner's last laid-out frame;
+        // events only arrive from an already-configured runner, but degrade
+        // to an empty context rather than unwrap if that ever changes.
+        let cx = match &s.swapchain {
+            Some(sc) => damascene_core::EventCx::new().with_ui_state(sc.runner.ui_state()),
+            None => damascene_core::EventCx::new(),
+        };
         for event in events {
-            s.app.on_event(event);
+            s.app.on_event(event, &cx);
         }
         // Side effects the app requested (it can't talk wayland itself).
         if let Some(slot) = s.app.take_activate() {

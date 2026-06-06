@@ -194,7 +194,7 @@ impl App for BarApp {
         panel
     }
 
-    fn on_event(&mut self, event: UiEvent) {
+    fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
         for ws in &self.workspaces {
             if event.is_click_or_activate(&format!("ws-{}", ws.slot)) {
                 self.pending_activate = Some(ws.slot);
