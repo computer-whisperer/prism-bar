@@ -395,17 +395,27 @@ async fn add_item(state: Shared, conn: Connection, address: Address, registered:
         watch_item(state.clone(), proxy.clone(), address.clone()),
         "tray-item-signals",
     );
-    state.lock().unwrap().items.insert(
-        key,
-        ItemState {
-            address,
-            registered,
-            view,
-            passive,
-            menu_path,
-            _task: task,
-        },
-    );
+    {
+        let mut guard = state.lock().unwrap();
+        // Re-check: in host mode the initial enumeration and a racing
+        // Registered signal can both reach here for the same item (the
+        // awaits above are yield points). Keep the first registration —
+        // overwriting would cancel its signal-watch task.
+        if guard.items.contains_key(&key) {
+            return;
+        }
+        guard.items.insert(
+            key,
+            ItemState {
+                address,
+                registered,
+                view,
+                passive,
+                menu_path,
+                _task: task,
+            },
+        );
+    }
     push_snapshot(&state);
 }
 
@@ -594,6 +604,15 @@ async fn run(events: Sender<TrayEvent>, cmd_rx: async_channel::Receiver<TrayCmd>
 
     if reply == RequestNameReply::PrimaryOwner {
         tracing::info!("acting as {WATCHER_NAME}");
+        // We are the (only) host; announce it for items that wait on
+        // the signal rather than polling the property.
+        if let Ok(iface) = conn
+            .object_server()
+            .interface::<_, Watcher>(WATCHER_PATH)
+            .await
+        {
+            let _ = Watcher::status_notifier_host_registered(iface.signal_emitter()).await;
+        }
         _tasks.push(conn.executor().spawn(
             watch_name_owners(state.clone(), conn.clone()),
             "tray-name-owners",

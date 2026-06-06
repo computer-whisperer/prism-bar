@@ -268,7 +268,7 @@ impl App for BarApp {
             };
             // SNI conventions: left = Activate (menu when the item asks
             // for it), right = context menu, middle = SecondaryActivate.
-            self.pending_tray = match event.kind {
+            let action = match event.kind {
                 UiEventKind::Click | UiEventKind::Activate => {
                     if item.item_is_menu && item.has_menu {
                         open_menu()
@@ -281,8 +281,11 @@ impl App for BarApp {
                     item.address.clone(),
                 ))),
                 _ => None,
+            };
+            // Don't clobber an action a prior event in this batch set.
+            if action.is_some() {
+                self.pending_tray = action;
             }
-            .or(self.pending_tray.take());
         }
     }
 }
