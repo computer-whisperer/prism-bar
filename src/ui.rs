@@ -96,18 +96,23 @@ impl BarApp {
     }
 }
 
+/// ThemeName → damascene palette, shared by the bar and menu apps.
+pub fn theme_of(name: ThemeName) -> Theme {
+    match name {
+        ThemeName::Dark => Theme::damascene_dark(),
+        ThemeName::Light => Theme::damascene_light(),
+        ThemeName::SlateBlueDark => Theme::radix_slate_blue_dark(),
+        ThemeName::SlateBlueLight => Theme::radix_slate_blue_light(),
+        ThemeName::SandAmberDark => Theme::radix_sand_amber_dark(),
+        ThemeName::SandAmberLight => Theme::radix_sand_amber_light(),
+        ThemeName::MauveVioletDark => Theme::radix_mauve_violet_dark(),
+        ThemeName::MauveVioletLight => Theme::radix_mauve_violet_light(),
+    }
+}
+
 impl App for BarApp {
     fn theme(&self) -> Theme {
-        match self.appearance.theme {
-            ThemeName::Dark => Theme::damascene_dark(),
-            ThemeName::Light => Theme::damascene_light(),
-            ThemeName::SlateBlueDark => Theme::radix_slate_blue_dark(),
-            ThemeName::SlateBlueLight => Theme::radix_slate_blue_light(),
-            ThemeName::SandAmberDark => Theme::radix_sand_amber_dark(),
-            ThemeName::SandAmberLight => Theme::radix_sand_amber_light(),
-            ThemeName::MauveVioletDark => Theme::radix_mauve_violet_dark(),
-            ThemeName::MauveVioletLight => Theme::radix_mauve_violet_light(),
-        }
+        theme_of(self.appearance.theme)
     }
 
     fn before_build(&mut self) {

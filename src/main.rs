@@ -12,6 +12,7 @@
 //!   SCTK pointer events → routed by wl_surface → runner.pointer_*()
 
 mod config;
+mod menu;
 mod sysmon;
 mod toplevels;
 mod tray;
@@ -39,24 +40,30 @@ use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
     LayerSurfaceConfigure,
 };
+use smithay_client_toolkit::shell::xdg::popup::{Popup, PopupConfigure, PopupHandler};
+use smithay_client_toolkit::shell::xdg::{XdgPositioner, XdgShell};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::{
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, registry_handlers,
+    delegate_seat, delegate_xdg_popup, registry_handlers,
 };
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_output, wl_pointer, wl_seat, wl_surface};
 use wayland_client::{Connection, Proxy, QueueHandle};
+use wayland_protocols::xdg::shell::client::xdg_positioner::{
+    Anchor as XdgAnchor, ConstraintAdjustment, Gravity,
+};
 
 use damascene_core::event::{Pointer, PointerButton};
-use damascene_core::prelude::{App, Rect};
+use damascene_core::prelude::{App, Rect, Theme};
 use damascene_core::BuildCx;
 use damascene_wgpu::{MsaaTarget, Runner, RunnerCaps};
 
 use crate::config::{Appearance, Config, Module, Position};
+use crate::menu::MenuApp;
 use crate::sysmon::SysMon;
 use crate::toplevels::ToplevelsState;
-use crate::tray::{Tray, TrayEvent, TrayItem};
+use crate::tray::{Address, MenuNode, Tray, TrayCmd, TrayEvent, TrayItem};
 use crate::ui::{BarApp, TrayAction};
 use crate::workspaces::WorkspacesState;
 
@@ -89,6 +96,7 @@ fn main() -> Result<()> {
         seat_state: SeatState::new(&globals, &qh),
         compositor: CompositorState::bind(&globals, &qh).context("wl_compositor")?,
         layer_shell: LayerShell::bind(&globals, &qh).context("zwlr_layer_shell_v1")?,
+        xdg_shell: XdgShell::bind(&globals, &qh).context("xdg_wm_base")?,
         workspaces: WorkspacesState::bind(&globals, &qh),
         toplevels: ToplevelsState::bind(&globals, &qh),
         conn: conn.clone(),
@@ -104,6 +112,10 @@ fn main() -> Result<()> {
         tray: None,
         tray_send,
         tray_items: Vec::new(),
+        pending_menu: None,
+        menu: None,
+        seat: None,
+        last_press_serial: 0,
         reload_at: None,
         dirty: false,
         last_clock_secs: 0,
@@ -116,11 +128,12 @@ fn main() -> Result<()> {
         .insert(event_loop.handle())
         .map_err(|e| anyhow::anyhow!("insert wayland source: {e}"))?;
     watch_config(&mut event_loop)?;
+    let tray_qh = qh.clone();
     event_loop
         .handle()
-        .insert_source(tray_recv, |event, _, bar: &mut Bar| {
+        .insert_source(tray_recv, move |event, _, bar: &mut Bar| {
             if let calloop_channel::Event::Msg(event) = event {
-                bar.on_tray_event(event);
+                bar.on_tray_event(&tray_qh, event);
             }
         })
         .map_err(|e| anyhow::anyhow!("insert tray source: {e}"))?;
@@ -147,6 +160,9 @@ fn main() -> Result<()> {
             if let Some(d) = s.anim_deadline {
                 timeout = timeout.min(d.saturating_duration_since(now));
             }
+        }
+        if let Some(d) = bar.menu.as_ref().and_then(|m| m.anim_deadline) {
+            timeout = timeout.min(d.saturating_duration_since(now));
         }
 
         event_loop
@@ -187,11 +203,20 @@ fn main() -> Result<()> {
                 s.dirty = true;
             }
         }
+        if let Some(m) = bar.menu.as_mut() {
+            if m.anim_deadline.is_some_and(|d| d <= now) {
+                m.anim_deadline = None;
+                m.dirty = true;
+            }
+        }
 
         for i in 0..bar.surfaces.len() {
             if bar.surfaces[i].dirty {
                 bar.draw(i);
             }
+        }
+        if bar.menu.as_ref().is_some_and(|m| m.dirty) {
+            bar.draw_menu();
         }
     }
     Ok(())
@@ -206,12 +231,196 @@ struct GpuShared {
     queue: wgpu::Queue,
 }
 
-/// Swapchain + renderer for one bar surface; created on its first
-/// layer-shell configure (before that we don't know the size).
+/// Swapchain + renderer for one surface (bar or menu popup); created
+/// on the surface's first configure (before that we don't know the
+/// size).
 struct Swapchain {
     config: wgpu::SurfaceConfiguration,
     msaa: Option<MsaaTarget>,
     runner: Runner,
+}
+
+/// Create or resize a swapchain for `(w, h)` physical pixels.
+fn setup_swapchain(
+    gpu: &GpuShared,
+    wgpu_surface: &wgpu::Surface<'_>,
+    swapchain: &mut Option<Swapchain>,
+    (w, h): (u32, u32),
+    theme: Theme,
+    label: &str,
+) {
+    match swapchain {
+        Some(sc) => {
+            if sc.config.width == w && sc.config.height == h {
+                return;
+            }
+            sc.config.width = w;
+            sc.config.height = h;
+            wgpu_surface.configure(&gpu.device, &sc.config);
+            sc.runner.set_surface_size(w, h);
+            let extent = wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            };
+            if let Some(msaa) = sc.msaa.as_mut() {
+                if !msaa.matches(extent) {
+                    *msaa =
+                        MsaaTarget::new(&gpu.device, sc.config.format, extent, msaa.sample_count);
+                }
+            }
+        }
+        None => {
+            let caps = wgpu_surface.get_capabilities(&gpu.adapter);
+            let format = caps
+                .formats
+                .iter()
+                .copied()
+                .find(|f| f.is_srgb())
+                .unwrap_or(caps.formats[0]);
+            // Transparent background: damascene's blend states leave
+            // correct premultiplied coverage over a transparent
+            // clear, so PreMultiplied is the right composite mode.
+            let alpha_mode = if caps
+                .alpha_modes
+                .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+            {
+                wgpu::CompositeAlphaMode::PreMultiplied
+            } else {
+                tracing::warn!(
+                    surface = %label,
+                    modes = ?caps.alpha_modes,
+                    "no premultiplied alpha; surface will be opaque"
+                );
+                caps.alpha_modes[0]
+            };
+            let config = wgpu::SurfaceConfiguration {
+                // COPY_SRC matches the runner's backdrop-snapshot path.
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                format,
+                width: w,
+                height: h,
+                present_mode: wgpu::PresentMode::Fifo,
+                alpha_mode,
+                view_formats: vec![],
+                desired_maximum_frame_latency: 1,
+            };
+            wgpu_surface.configure(&gpu.device, &config);
+
+            let mut runner = Runner::with_caps(
+                &gpu.device,
+                &gpu.queue,
+                format,
+                MSAA_SAMPLES,
+                RunnerCaps::from_adapter(&gpu.adapter),
+            );
+            runner.set_theme(theme);
+            runner.set_surface_size(w, h);
+            runner.warm_default_glyphs();
+
+            let msaa = (MSAA_SAMPLES > 1).then(|| {
+                MsaaTarget::new(
+                    &gpu.device,
+                    format,
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    MSAA_SAMPLES,
+                )
+            });
+            tracing::info!(surface = %label, ?format, "swapchain configured");
+            *swapchain = Some(Swapchain {
+                config,
+                msaa,
+                runner,
+            });
+        }
+    }
+}
+
+struct FrameOutcome {
+    /// The frame was lost/outdated; the surface was reconfigured and
+    /// the caller should redraw next loop turn.
+    retry: bool,
+    anim_deadline: Option<Instant>,
+}
+
+/// Build the app's tree and render one frame: build → prepare →
+/// acquire → render → present.
+fn render_frame<A: App>(
+    gpu: &GpuShared,
+    wgpu_surface: &wgpu::Surface<'_>,
+    sc: &mut Swapchain,
+    app: &mut A,
+    (width, height): (u32, u32),
+    scale: i32,
+    label: &str,
+) -> FrameOutcome {
+    let viewport = Rect::new(0.0, 0.0, width as f32, height as f32);
+
+    app.before_build();
+    let theme = app.theme();
+    let mut tree = {
+        let cx = BuildCx::new(&theme)
+            .with_ui_state(sc.runner.ui_state())
+            .with_viewport(viewport.w, viewport.h);
+        app.build(&cx)
+    };
+    sc.runner.set_theme(theme);
+    sc.runner.set_hotkeys(app.hotkeys());
+
+    let prepare = sc
+        .runner
+        .prepare(&gpu.device, &gpu.queue, &mut tree, viewport, scale as f32);
+
+    let frame = match wgpu_surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+        wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+            wgpu_surface.configure(&gpu.device, &sc.config);
+            return FrameOutcome {
+                retry: true,
+                anim_deadline: None,
+            };
+        }
+        other => {
+            tracing::error!(surface = %label, "surface unavailable: {other:?}");
+            return FrameOutcome {
+                retry: false,
+                anim_deadline: None,
+            };
+        }
+    };
+    let view = frame
+        .texture
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("prism-bar::encoder"),
+        });
+    sc.runner.render(
+        &gpu.device,
+        &mut encoder,
+        &frame.texture,
+        &view,
+        sc.msaa.as_ref().map(|m| &m.view),
+        // Transparent clear — the visible panel is a rounded rect in
+        // the tree; the compositor sees through the rest.
+        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+    );
+    gpu.queue.submit(Some(encoder.finish()));
+    frame.present();
+
+    let mut anim_deadline = prepare.next_redraw_in.map(|d| Instant::now() + d);
+    if prepare.needs_redraw && anim_deadline.is_none() {
+        anim_deadline = Some(Instant::now());
+    }
+    FrameOutcome {
+        retry: false,
+        anim_deadline,
+    }
 }
 
 struct BarSurface {
@@ -235,12 +444,48 @@ struct BarSurface {
     pointer_pos: (f64, f64),
 }
 
+/// A tray-menu request in flight: the click landed, the dbusmenu
+/// layout hasn't arrived yet.
+struct PendingMenu {
+    address: Address,
+    /// Icon rect in the bar's surface-local logical coordinates.
+    anchor: Rect,
+    /// The bar surface the popup will parent to.
+    parent: wl_surface::WlSurface,
+    /// Click serial, for the popup grab.
+    serial: u32,
+}
+
+/// The tray-menu popup (one at a time): an xdg_popup parented to a bar
+/// layer surface via `zwlr_layer_surface_v1.get_popup`, with its own
+/// swapchain and damascene runner.
+struct MenuSurface {
+    // Drop order: wgpu surface first (it borrows the wl_surface kept
+    // alive by `popup`), same as BarSurface.
+    wgpu_surface: wgpu::Surface<'static>,
+    swapchain: Option<Swapchain>,
+    popup: Popup,
+    /// The parenting bar surface; the menu dies with it.
+    parent: wl_surface::WlSurface,
+    address: Address,
+    app: MenuApp,
+    /// Logical size (from the popup configure).
+    width: u32,
+    height: u32,
+    scale: i32,
+    dirty: bool,
+    anim_deadline: Option<Instant>,
+    pointer_pos: (f64, f64),
+}
+
 struct Bar {
     registry_state: RegistryState,
     output_state: OutputState,
     seat_state: SeatState,
     compositor: CompositorState,
     layer_shell: LayerShell,
+    /// For tray-menu popups (xdg_popup needs an xdg_wm_base).
+    xdg_shell: XdgShell,
     workspaces: WorkspacesState,
     toplevels: ToplevelsState,
     conn: Connection,
@@ -260,6 +505,13 @@ struct Bar {
     tray_send: calloop_channel::Sender<TrayEvent>,
     /// Latest tray snapshot, fanned out to every BarApp per draw.
     tray_items: Vec<TrayItem>,
+    /// Menu click waiting on its dbusmenu layout.
+    pending_menu: Option<PendingMenu>,
+    /// The open tray menu, if any.
+    menu: Option<MenuSurface>,
+    /// Seat + serial of the last button press, for popup grabs.
+    seat: Option<wl_seat::WlSeat>,
+    last_press_serial: u32,
     has_clock: bool,
     /// Debounced config-reload deadline (armed by the inotify source).
     reload_at: Option<Instant>,
@@ -376,21 +628,221 @@ impl Bar {
         }
     }
 
-    fn on_tray_event(&mut self, event: TrayEvent) {
+    fn on_tray_event(&mut self, qh: &QueueHandle<Self>, event: TrayEvent) {
         match event {
             TrayEvent::Items(items) => {
                 self.tray_items = items;
                 self.dirty = true;
             }
-            // Menu surfaces land with the popup work; until then the
-            // reply is just logged so the D-Bus side can be exercised.
             TrayEvent::Menu { address, root } => {
-                tracing::debug!(
-                    ?root,
-                    "menu layout for {address:?} (popup not implemented yet)"
-                );
+                let Some(pending) = self.pending_menu.take_if(|p| p.address == address) else {
+                    return; // stale reply (icon clicked again, config reloaded…)
+                };
+                self.open_menu(qh, pending, root);
             }
-            TrayEvent::MenuError { .. } => {}
+            TrayEvent::MenuError { address } => {
+                self.pending_menu.take_if(|p| p.address == address);
+            }
+        }
+    }
+
+    /// Map the tray menu as an xdg_popup parented to the bar's layer
+    /// surface (`zwlr_layer_surface_v1.get_popup`), grabbed on the
+    /// triggering click so the compositor dismisses it on outside
+    /// clicks (`popup_done` → [`PopupHandler::done`]).
+    fn open_menu(&mut self, qh: &QueueHandle<Self>, pending: PendingMenu, root: MenuNode) {
+        self.close_menu();
+        let Some(parent_i) = self.surface_index_for(&pending.parent) else {
+            return; // bar surface gone while the layout was in flight
+        };
+
+        let app = MenuApp::new(self.appearance.clone(), root);
+        let (mw, mh) = app.desired_size();
+        let (mw, mh) = (mw.ceil() as i32, mh.ceil() as i32);
+
+        let positioner = match XdgPositioner::new(&self.xdg_shell) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::error!(%err, "xdg_positioner");
+                return;
+            }
+        };
+        positioner.set_size(mw, mh);
+        let a = pending.anchor;
+        positioner.set_anchor_rect(
+            a.x.floor() as i32,
+            a.y.floor() as i32,
+            (a.w.ceil() as i32).max(1),
+            (a.h.ceil() as i32).max(1),
+        );
+        // Drop away from the bar's screen edge; flip if it doesn't fit.
+        match self.config.position {
+            Position::Top => {
+                positioner.set_anchor(XdgAnchor::Bottom);
+                positioner.set_gravity(Gravity::Bottom);
+            }
+            Position::Bottom => {
+                positioner.set_anchor(XdgAnchor::Top);
+                positioner.set_gravity(Gravity::Top);
+            }
+        }
+        positioner
+            .set_constraint_adjustment(ConstraintAdjustment::SlideX | ConstraintAdjustment::FlipY);
+
+        let surface = self.compositor.create_surface(qh);
+        let popup = match Popup::from_surface(None, &positioner, qh, surface, &self.xdg_shell) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::error!(%err, "xdg_popup");
+                return;
+            }
+        };
+        let parent = &self.surfaces[parent_i];
+        parent.layer.get_popup(popup.xdg_popup());
+        if let Some(seat) = &self.seat {
+            popup.xdg_popup().grab(seat, pending.serial);
+        }
+        let scale = parent.scale;
+        popup.wl_surface().set_buffer_scale(scale);
+        popup.wl_surface().commit();
+
+        // SAFETY: same invariant as in create_bar — `conn` is owned by
+        // `Bar`, the wl_surface by `popup`, and `wgpu_surface` drops
+        // first (MenuSurface field order).
+        let raw_display = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
+            NonNull::new(self.conn.backend().display_ptr() as *mut _).expect("display ptr"),
+        ));
+        let raw_window = RawWindowHandle::Wayland(WaylandWindowHandle::new(
+            NonNull::new(popup.wl_surface().id().as_ptr() as *mut _).expect("surface ptr"),
+        ));
+        let wgpu_surface = unsafe {
+            self.instance
+                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: Some(raw_display),
+                    raw_window_handle: raw_window,
+                })
+        }
+        .expect("create wgpu surface on popup");
+
+        self.menu = Some(MenuSurface {
+            wgpu_surface,
+            swapchain: None,
+            popup,
+            parent: pending.parent,
+            address: pending.address,
+            app,
+            width: mw as u32,
+            height: mh as u32,
+            scale,
+            dirty: false,
+            anim_deadline: None,
+            pointer_pos: (0.0, 0.0),
+        });
+    }
+
+    /// Tear the menu down, telling the item's dbusmenu it closed.
+    fn close_menu(&mut self) {
+        if let Some(menu) = self.menu.take() {
+            if let Some(tray) = &self.tray {
+                tray.send(TrayCmd::MenuClosed(menu.address.clone()));
+            }
+        }
+    }
+
+    /// Close the menu if its parenting bar surface is gone (output
+    /// unplugged, config reload dropped the bar).
+    fn drop_orphaned_menu(&mut self) {
+        if let Some(m) = &self.menu {
+            if self.surface_index_for(&m.parent).is_none() {
+                self.close_menu();
+            }
+        }
+    }
+
+    fn configure_menu_swapchain(&mut self) {
+        let Some(gpu) = self.gpu.as_ref() else {
+            return;
+        };
+        let Some(m) = self.menu.as_mut() else {
+            return;
+        };
+        let scale = m.scale as u32;
+        let (w, h) = ((m.width * scale).max(1), (m.height * scale).max(1));
+        let theme = m.app.theme();
+        setup_swapchain(
+            gpu,
+            &m.wgpu_surface,
+            &mut m.swapchain,
+            (w, h),
+            theme,
+            "menu",
+        );
+    }
+
+    fn draw_menu(&mut self) {
+        let Some(gpu) = self.gpu.as_ref() else {
+            return;
+        };
+        let Some(m) = self.menu.as_mut() else {
+            return;
+        };
+        m.dirty = false;
+        let Some(sc) = m.swapchain.as_mut() else {
+            return; // not configured yet; the configure will redraw
+        };
+        let outcome = render_frame(
+            gpu,
+            &m.wgpu_surface,
+            sc,
+            &mut m.app,
+            (m.width, m.height),
+            m.scale,
+            "menu",
+        );
+        m.dirty = outcome.retry;
+        m.anim_deadline = outcome.anim_deadline;
+    }
+
+    /// Pointer event on the menu popup's surface.
+    fn menu_pointer_event(&mut self, event: &PointerEvent) {
+        let Some(m) = self.menu.as_mut() else {
+            return;
+        };
+        let Some(sc) = m.swapchain.as_mut() else {
+            return;
+        };
+        let (x, y) = (event.position.0 as f32, event.position.1 as f32);
+        let events = match event.kind {
+            PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                m.pointer_pos = event.position;
+                sc.runner.pointer_moved(Pointer::moving(x, y)).events
+            }
+            PointerEventKind::Leave { .. } => sc.runner.pointer_left(),
+            PointerEventKind::Press { button, .. } | PointerEventKind::Release { button, .. } => {
+                let Some(button) = linux_button(button) else {
+                    return;
+                };
+                let p = Pointer::mouse(m.pointer_pos.0 as f32, m.pointer_pos.1 as f32, button);
+                if matches!(event.kind, PointerEventKind::Press { .. }) {
+                    sc.runner.pointer_down(p)
+                } else {
+                    sc.runner.pointer_up(p)
+                }
+            }
+            PointerEventKind::Axis { .. } => return,
+        };
+        m.dirty = true;
+        let cx = damascene_core::EventCx::new().with_ui_state(sc.runner.ui_state());
+        for e in events {
+            m.app.on_event(e, &cx);
+        }
+        // A leaf click both reports to the app and closes the menu.
+        let clicked = m.app.take_clicked().map(|id| (m.address.clone(), id));
+        if let Some((address, id)) = clicked {
+            if let Some(tray) = &self.tray {
+                tray.send(TrayCmd::MenuClicked { address, id });
+            }
+            self.close_menu();
         }
     }
 
@@ -411,6 +863,10 @@ impl Bar {
         self.has_clock = self.modules.iter().any(|m| matches!(m, Module::Clock(_)));
         self.sysmon = SysMon::new(&self.modules, self.config.sample_interval);
         self.ensure_tray();
+        // The menu renders stale appearance/items after a reload; the
+        // user can reopen it.
+        self.close_menu();
+        self.pending_menu = None;
 
         // Drop bars on outputs the new config no longer wants.
         self.surfaces.retain(|s| {
@@ -448,100 +904,15 @@ impl Bar {
         let s = &mut self.surfaces[i];
         let scale = s.scale as u32;
         let (w, h) = ((s.width * scale).max(1), (s.height * scale).max(1));
-
-        match &mut s.swapchain {
-            Some(sc) => {
-                if sc.config.width == w && sc.config.height == h {
-                    return;
-                }
-                sc.config.width = w;
-                sc.config.height = h;
-                s.wgpu_surface.configure(&gpu.device, &sc.config);
-                sc.runner.set_surface_size(w, h);
-                let extent = wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                };
-                if let Some(msaa) = sc.msaa.as_mut() {
-                    if !msaa.matches(extent) {
-                        *msaa = MsaaTarget::new(
-                            &gpu.device,
-                            sc.config.format,
-                            extent,
-                            msaa.sample_count,
-                        );
-                    }
-                }
-            }
-            None => {
-                let caps = s.wgpu_surface.get_capabilities(&gpu.adapter);
-                let format = caps
-                    .formats
-                    .iter()
-                    .copied()
-                    .find(|f| f.is_srgb())
-                    .unwrap_or(caps.formats[0]);
-                // Transparent background: damascene's blend states leave
-                // correct premultiplied coverage over a transparent
-                // clear, so PreMultiplied is the right composite mode.
-                let alpha_mode = if caps
-                    .alpha_modes
-                    .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
-                {
-                    wgpu::CompositeAlphaMode::PreMultiplied
-                } else {
-                    tracing::warn!(
-                        output = %s.output_name,
-                        modes = ?caps.alpha_modes,
-                        "no premultiplied alpha; bar will be opaque"
-                    );
-                    caps.alpha_modes[0]
-                };
-                let config = wgpu::SurfaceConfiguration {
-                    // COPY_SRC matches the runner's backdrop-snapshot path.
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                    format,
-                    width: w,
-                    height: h,
-                    present_mode: wgpu::PresentMode::Fifo,
-                    alpha_mode,
-                    view_formats: vec![],
-                    desired_maximum_frame_latency: 1,
-                };
-                s.wgpu_surface.configure(&gpu.device, &config);
-
-                let mut runner = Runner::with_caps(
-                    &gpu.device,
-                    &gpu.queue,
-                    format,
-                    MSAA_SAMPLES,
-                    RunnerCaps::from_adapter(&gpu.adapter),
-                );
-                runner.set_theme(s.app.theme());
-                runner.set_surface_size(w, h);
-                runner.warm_default_glyphs();
-
-                let msaa = (MSAA_SAMPLES > 1).then(|| {
-                    MsaaTarget::new(
-                        &gpu.device,
-                        format,
-                        wgpu::Extent3d {
-                            width: w,
-                            height: h,
-                            depth_or_array_layers: 1,
-                        },
-                        MSAA_SAMPLES,
-                    )
-                });
-                tracing::info!(output = %s.output_name, ?format, "swapchain configured");
-                s.swapchain = Some(Swapchain {
-                    config,
-                    msaa,
-                    runner,
-                });
-            }
-        }
+        let theme = s.app.theme();
+        setup_swapchain(
+            gpu,
+            &s.wgpu_surface,
+            &mut s.swapchain,
+            (w, h),
+            theme,
+            &s.output_name,
+        );
     }
 
     fn draw(&mut self, i: usize) {
@@ -557,68 +928,23 @@ impl Bar {
             return; // not configured yet; the configure will redraw
         };
 
-        let scale = s.scale as f32;
-        let viewport = Rect::new(0.0, 0.0, s.width as f32, s.height as f32);
-
         s.app.set_state(
             ws,
             title,
             self.sysmon.stats.clone(),
             self.tray_items.clone(),
         );
-        s.app.before_build();
-        let theme = s.app.theme();
-        let mut tree = {
-            let cx = BuildCx::new(&theme)
-                .with_ui_state(sc.runner.ui_state())
-                .with_viewport(viewport.w, viewport.h);
-            s.app.build(&cx)
-        };
-        sc.runner.set_theme(theme);
-        sc.runner.set_hotkeys(s.app.hotkeys());
-
-        let prepare = sc
-            .runner
-            .prepare(&gpu.device, &gpu.queue, &mut tree, viewport, scale);
-
-        let frame = match s.wgpu_surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                s.wgpu_surface.configure(&gpu.device, &sc.config);
-                s.dirty = true; // try again next loop turn
-                return;
-            }
-            other => {
-                tracing::error!(output = %s.output_name, "surface unavailable: {other:?}");
-                return;
-            }
-        };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("prism-bar::encoder"),
-            });
-        sc.runner.render(
-            &gpu.device,
-            &mut encoder,
-            &frame.texture,
-            &view,
-            sc.msaa.as_ref().map(|m| &m.view),
-            // Transparent clear — the visible bar background is a rounded
-            // rect in the tree; the compositor sees through the rest.
-            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        let outcome = render_frame(
+            gpu,
+            &s.wgpu_surface,
+            sc,
+            &mut s.app,
+            (s.width, s.height),
+            s.scale,
+            &s.output_name,
         );
-        gpu.queue.submit(Some(encoder.finish()));
-        frame.present();
-
-        s.anim_deadline = prepare.next_redraw_in.map(|d| Instant::now() + d);
-        if prepare.needs_redraw && s.anim_deadline.is_none() {
-            s.anim_deadline = Some(Instant::now());
-        }
+        s.dirty = outcome.retry;
+        s.anim_deadline = outcome.anim_deadline;
     }
 
     fn surface_index_for(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
@@ -654,11 +980,17 @@ impl Bar {
                     }
                 }
                 TrayAction::OpenMenu { address, anchor } => {
-                    // The popup surface lands next; for now fetch the
-                    // layout so the dbusmenu path can be exercised.
-                    tracing::debug!(?anchor, "menu requested");
+                    // Remember the click context; the popup maps when
+                    // the dbusmenu layout arrives (TrayEvent::Menu).
+                    self.close_menu();
+                    self.pending_menu = Some(PendingMenu {
+                        address: address.clone(),
+                        anchor,
+                        parent: self.surfaces[i].layer.wl_surface().clone(),
+                        serial: self.last_press_serial,
+                    });
                     if let Some(tray) = &self.tray {
-                        tray.send(crate::tray::TrayCmd::MenuOpen(address));
+                        tray.send(TrayCmd::MenuOpen(address));
                     }
                 }
             }
@@ -673,6 +1005,7 @@ impl LayerShellHandler for Bar {
         // away); drop the bar but keep running for hotplug.
         self.surfaces
             .retain(|s| s.layer.wl_surface() != layer.wl_surface());
+        self.drop_orphaned_menu();
     }
 
     fn configure(
@@ -701,6 +1034,40 @@ impl LayerShellHandler for Bar {
     }
 }
 
+impl PopupHandler for Bar {
+    fn configure(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        popup: &Popup,
+        config: PopupConfigure,
+    ) {
+        if !self.menu.as_ref().is_some_and(|m| m.popup == *popup) {
+            return;
+        }
+        {
+            let m = self.menu.as_mut().expect("checked above");
+            if config.width > 0 {
+                m.width = config.width as u32;
+            }
+            if config.height > 0 {
+                m.height = config.height as u32;
+            }
+        }
+        self.configure_menu_swapchain();
+        if let Some(m) = self.menu.as_mut() {
+            m.dirty = true;
+        }
+    }
+
+    fn done(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, popup: &Popup) {
+        // Compositor dismissed the popup (outside click broke the grab).
+        if self.menu.as_ref().is_some_and(|m| m.popup == *popup) {
+            self.close_menu();
+        }
+    }
+}
+
 impl CompositorHandler for Bar {
     fn scale_factor_changed(
         &mut self,
@@ -709,6 +1076,24 @@ impl CompositorHandler for Bar {
         surface: &wl_surface::WlSurface,
         new_factor: i32,
     ) {
+        if self
+            .menu
+            .as_ref()
+            .is_some_and(|m| m.popup.wl_surface() == surface)
+        {
+            let m = self.menu.as_mut().expect("checked above");
+            if m.scale != new_factor {
+                m.scale = new_factor;
+                surface.set_buffer_scale(new_factor);
+                if m.swapchain.is_some() {
+                    self.configure_menu_swapchain();
+                }
+                if let Some(m) = self.menu.as_mut() {
+                    m.dirty = true;
+                }
+            }
+            return;
+        }
         let Some(i) = self.surface_index_for(surface) else {
             return;
         };
@@ -805,6 +1190,7 @@ impl OutputHandler for Bar {
         if self.surfaces.len() != before {
             tracing::info!("output gone; bar removed");
         }
+        self.drop_orphaned_menu();
     }
 }
 
@@ -824,6 +1210,7 @@ impl SeatHandler for Bar {
     ) {
         if capability == Capability::Pointer && self.pointer.is_none() {
             self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
+            self.seat = Some(seat);
         }
     }
 
@@ -853,6 +1240,18 @@ impl PointerHandler for Bar {
         events: &[PointerEvent],
     ) {
         for event in events {
+            // Grab serials come from button presses on any surface.
+            if let PointerEventKind::Press { serial, .. } = event.kind {
+                self.last_press_serial = serial;
+            }
+            if self
+                .menu
+                .as_ref()
+                .is_some_and(|m| m.popup.wl_surface() == &event.surface)
+            {
+                self.menu_pointer_event(event);
+                continue;
+            }
             let Some(i) = self.surface_index_for(&event.surface) else {
                 continue;
             };
@@ -982,6 +1381,31 @@ impl ProvidesRegistryState for Bar {
 delegate_compositor!(Bar);
 delegate_output!(Bar);
 delegate_layer!(Bar);
+// Not delegate_xdg_shell!: that macro also wires the xdg-decoration
+// objects, whose SCTK dispatch impls demand a WindowHandler. Popups
+// only need the wm_base; the decoration manager (bound as part of
+// XdgShell::bind) has no events, so a manual no-op dispatch suffices.
+wayland_client::delegate_dispatch!(Bar: [
+    wayland_protocols::xdg::shell::client::xdg_wm_base::XdgWmBase: smithay_client_toolkit::globals::GlobalData
+] => XdgShell);
+impl
+    wayland_client::Dispatch<
+        wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+        smithay_client_toolkit::globals::GlobalData,
+    > for Bar
+{
+    fn event(
+        _: &mut Self,
+        _: &wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+        _: wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::Event,
+        _: &smithay_client_toolkit::globals::GlobalData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        unreachable!("zxdg_decoration_manager_v1 has no events");
+    }
+}
+delegate_xdg_popup!(Bar);
 delegate_seat!(Bar);
 delegate_pointer!(Bar);
 delegate_registry!(Bar);
