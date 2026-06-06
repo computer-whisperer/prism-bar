@@ -57,3 +57,11 @@ async-channel = "2"
 futures-util = { version = "0.3", default-features = false }
 # Icon-theme lookup decodes png files (svg goes through damascene).
 png = "0.17"
+
+# Unoptimized damascene is unusable: glyph warming alone takes ~19s per
+# swapchain (measured), which — running inside a wayland dispatch
+# callback — starves the socket long enough for the compositor to
+# disconnect us. Optimize dependencies even in dev; our own crate stays
+# at opt-level 0 for debuggability.
+[profile.dev.package."*"]
+opt-level = 2

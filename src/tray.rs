@@ -275,6 +275,11 @@ fn push_snapshot(state: &Shared) {
         .filter(|i| !i.passive)
         .map(|i| i.view.clone())
         .collect();
+    tracing::debug!(
+        visible = items.len(),
+        total = guard.items.len(),
+        "pushing tray snapshot"
+    );
     if guard.events.send(TrayEvent::Items(items)).is_err() {
         tracing::warn!("main loop channel closed; dropping tray snapshot");
     }
@@ -901,10 +906,12 @@ fn best_pixmap(pixmaps: Vec<(i32, i32, Vec<u8>)>) -> Option<TrayIcon> {
 }
 
 /// Freedesktop-ish icon lookup, deliberately partial: the app's own
-/// `IconThemePath` first, then hicolor in the XDG data dirs, then flat
-/// pixmaps. No theme inheritance — tray apps install into hicolor (the
-/// mandated fallback) almost without exception, and chasing the user's
-/// GTK theme isn't worth the complexity here.
+/// `IconThemePath` first, then hicolor (the mandated fallback), then
+/// the stock desktop themes, then anything else installed, then flat
+/// pixmaps. We don't resolve the user's configured theme + inheritance
+/// chain; in practice status icons live in one of the stock themes.
+/// First theme root with a hit wins; within a root the best-ranked
+/// candidate wins (see [`rank_png`]).
 fn lookup_icon(name: &str, theme_path: &str) -> Option<TrayIcon> {
     if name.is_empty() {
         return None;
@@ -914,93 +921,132 @@ fn lookup_icon(name: &str, theme_path: &str) -> Option<TrayIcon> {
         return load_icon_file(Path::new(name));
     }
 
-    let mut best: Option<(u32, PathBuf)> = None;
-
+    let mut roots: Vec<PathBuf> = Vec::new();
     if !theme_path.is_empty() {
         let tp = Path::new(theme_path);
         // Both layouts exist in the wild: icons directly in the dir,
-        // or a theme tree (sized subdirectories) rooted there.
+        // or a theme tree rooted there.
         for ext in ["svg", "png"] {
             let direct = tp.join(format!("{name}.{ext}"));
             if direct.is_file() {
-                consider(&mut best, if ext == "svg" { SCALABLE } else { 0 }, direct);
+                return load_icon_file(&direct);
             }
         }
-        search_theme_root(tp, name, &mut best);
-        search_theme_root(&tp.join("hicolor"), name, &mut best);
+        roots.push(tp.to_path_buf());
+    }
+    let data_dirs = xdg_data_dirs();
+    for theme in ["hicolor", "Adwaita", "breeze", "AdwaitaLegacy"] {
+        for dir in &data_dirs {
+            roots.push(dir.join("icons").join(theme));
+        }
+    }
+    // Last resort: every other installed theme, alphabetically.
+    for dir in &data_dirs {
+        let Ok(themes) = std::fs::read_dir(dir.join("icons")) else {
+            continue;
+        };
+        let mut extra: Vec<PathBuf> = themes
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| !roots.contains(p))
+            .collect();
+        extra.sort();
+        roots.extend(extra);
     }
 
-    for dir in xdg_data_dirs() {
-        search_theme_root(&dir.join("icons/hicolor"), name, &mut best);
-    }
-    if best.is_none() {
-        for dir in xdg_data_dirs() {
-            for ext in ["svg", "png"] {
-                let p = dir.join(format!("pixmaps/{name}.{ext}"));
-                if p.is_file() {
-                    consider(&mut best, if ext == "svg" { SCALABLE } else { 0 }, p);
-                }
-            }
+    for root in &roots {
+        let mut best: Option<(IconRank, PathBuf)> = None;
+        search_theme_root(root, name, &mut best);
+        if let Some((_, path)) = best {
+            return load_icon_file(&path);
         }
     }
 
-    let (_, path) = best?;
-    load_icon_file(&path)
-}
-
-/// Keep the better-ranked candidate (see [`icon_size_rank`]).
-fn consider(best: &mut Option<(u32, PathBuf)>, size: u32, path: PathBuf) {
-    let better = match best {
-        None => true,
-        Some((cur, _)) => icon_size_rank(size) < icon_size_rank(*cur),
-    };
-    if better {
-        *best = Some((size, path));
+    for dir in &data_dirs {
+        for ext in ["svg", "png"] {
+            let p = dir.join(format!("pixmaps/{name}.{ext}"));
+            if p.is_file() {
+                return load_icon_file(&p);
+            }
+        }
     }
+    None
 }
 
-/// Pseudo-size marking scalable (svg) entries — always preferred.
-const SCALABLE: u32 = u32::MAX;
+/// Candidate ordering within one theme root; lower is better. Class:
+/// 0 = svg (scalable), 1 = symbolic svg (renders fine, but a colored
+/// icon is the canonical one), 2 = png at/above the target size
+/// (smallest first), 3 = png below it (largest first).
+type IconRank = (u8, u32);
 
-/// Lower rank is better: svg, then smallest raster ≥ target, then
-/// largest raster below it.
-fn icon_size_rank(size: u32) -> (u8, u32) {
-    if size == SCALABLE {
-        (0, 0)
-    } else if size >= ICON_TARGET {
-        (1, size)
+fn rank_png(size: u32) -> IconRank {
+    if size >= ICON_TARGET {
+        (2, size)
     } else {
-        (2, u32::MAX - size)
+        (3, u32::MAX - size)
     }
 }
 
-/// Scan one theme root (`…/icons/hicolor`-shaped): size directories
-/// (`48x48`, `scalable`, `symbolic`) each holding category directories.
-/// Direct existence checks only — no full tree walk.
-fn search_theme_root(root: &Path, name: &str, best: &mut Option<(u32, PathBuf)>) {
-    let Ok(sizes) = std::fs::read_dir(root) else {
+fn consider(best: &mut Option<(IconRank, PathBuf)>, rank: IconRank, path: PathBuf) {
+    if best.as_ref().is_none_or(|(cur, _)| rank < *cur) {
+        *best = Some((rank, path));
+    }
+}
+
+/// A directory component's size meaning: hicolor-style `48x48`,
+/// breeze-style bare `22`, or the scalable/symbolic buckets.
+fn dir_size_hint(component: &str) -> Option<u32> {
+    match component {
+        "scalable" | "symbolic" => Some(u32::MAX),
+        s => s
+            .split_once('x')
+            .map_or_else(|| s.parse().ok(), |(w, _)| w.parse().ok()),
+    }
+}
+
+/// Scan one theme root two directory levels deep, checking each level
+/// for `{name}.svg`, `{name}-symbolic.svg`, and `{name}.png`. Handles
+/// both `{size}/{category}` (hicolor, Adwaita) and `{category}/{size}`
+/// (breeze) layouts — whichever component parses as a size provides
+/// the png's nominal size. Direct existence checks only, no full walk.
+fn search_theme_root(root: &Path, name: &str, best: &mut Option<(IconRank, PathBuf)>) {
+    let check_dir = |dir: &Path, size_hint: Option<u32>, best: &mut Option<(IconRank, PathBuf)>| {
+        let svg = dir.join(format!("{name}.svg"));
+        if svg.is_file() {
+            consider(best, (0, 0), svg);
+        }
+        let symbolic = dir.join(format!("{name}-symbolic.svg"));
+        if symbolic.is_file() {
+            consider(best, (1, 0), symbolic);
+        }
+        let png = dir.join(format!("{name}.png"));
+        if png.is_file() {
+            consider(best, rank_png(size_hint.unwrap_or(0)), png);
+        }
+    };
+
+    let Ok(level1) = std::fs::read_dir(root) else {
         return;
     };
-    for size_entry in sizes.flatten() {
-        let size_name = size_entry.file_name();
-        let Some(size_name) = size_name.to_str() else {
+    for d1 in level1.flatten() {
+        if !d1.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let n1 = d1.file_name();
+        let Some(n1) = n1.to_str() else { continue };
+        let hint1 = dir_size_hint(n1);
+        let p1 = d1.path();
+        check_dir(&p1, hint1, best);
+        let Ok(level2) = std::fs::read_dir(&p1) else {
             continue;
         };
-        let (size, ext) = match size_name {
-            "scalable" | "symbolic" => (SCALABLE, "svg"),
-            s => match s.split_once('x').and_then(|(w, _)| w.parse::<u32>().ok()) {
-                Some(n) => (n, "png"),
-                None => continue,
-            },
-        };
-        let Ok(categories) = std::fs::read_dir(size_entry.path()) else {
-            continue;
-        };
-        for cat in categories.flatten() {
-            let p = cat.path().join(format!("{name}.{ext}"));
-            if p.is_file() {
-                consider(best, size, p);
+        for d2 in level2.flatten() {
+            if !d2.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
             }
+            let n2 = d2.file_name();
+            let Some(n2) = n2.to_str() else { continue };
+            check_dir(&d2.path(), dir_size_hint(n2).or(hint1), best);
         }
     }
 }
@@ -1029,7 +1075,21 @@ fn load_icon_file(path: &Path) -> Option<TrayIcon> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("svg") => {
             let text = std::fs::read_to_string(path).ok()?;
-            match SvgIcon::parse(&text) {
+            // Symbolic icons are monochrome coverage shapes meant to be
+            // recolored by the consumer; parse them as currentColor so
+            // damascene tints them with the theme foreground (their
+            // authored fill is a near-black that vanishes on dark bars).
+            let symbolic = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.ends_with("-symbolic"))
+                || path.components().any(|c| c.as_os_str() == "symbolic");
+            let parsed = if symbolic {
+                SvgIcon::parse_current_color(&text)
+            } else {
+                SvgIcon::parse(&text)
+            };
+            match parsed {
                 Ok(svg) => Some(TrayIcon::Svg(svg)),
                 Err(err) => {
                     tracing::debug!(path = %path.display(), ?err, "svg parse failed");

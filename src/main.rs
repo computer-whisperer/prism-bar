@@ -121,8 +121,6 @@ fn main() -> Result<()> {
         last_clock_secs: 0,
         exit: false,
     };
-    bar.ensure_tray();
-
     let mut event_loop: EventLoop<Bar> = EventLoop::try_new().context("calloop")?;
     WaylandSource::new(conn, event_queue)
         .insert(event_loop.handle())
@@ -137,6 +135,10 @@ fn main() -> Result<()> {
             }
         })
         .map_err(|e| anyhow::anyhow!("insert tray source: {e}"))?;
+    // Spawn the tray only after its channel source is in the loop: an
+    // already-running item registers within milliseconds, and a
+    // snapshot sent before the source is registered is never delivered.
+    bar.ensure_tray();
 
     // Surfaces are created by `new_output` as outputs are announced
     // (the same path handles initial enumeration and later hotplug).
@@ -165,9 +167,18 @@ fn main() -> Result<()> {
             timeout = timeout.min(d.saturating_duration_since(now));
         }
 
+        let before = Instant::now();
         event_loop
             .dispatch(Some(timeout), &mut bar)
             .context("event loop dispatch")?;
+        let blocked = before.elapsed();
+        if blocked > timeout + Duration::from_millis(500) {
+            tracing::warn!(
+                ?blocked,
+                ?timeout,
+                "dispatch overran its timeout (something blocked the loop)"
+            );
+        }
 
         // Global state change (workspaces, toplevels) → every bar.
         if bar.dirty {
@@ -212,7 +223,15 @@ fn main() -> Result<()> {
 
         for i in 0..bar.surfaces.len() {
             if bar.surfaces[i].dirty {
+                let t = Instant::now();
                 bar.draw(i);
+                let took = t.elapsed();
+                // Steady-state acquire on an idle output stalls ~1s
+                // (prism releases buffers with its repaint cycle); only
+                // flag the pathological case.
+                if took > Duration::from_millis(1500) {
+                    tracing::warn!(output = %bar.surfaces[i].output_name, ?took, "slow draw");
+                }
             }
         }
         if bar.menu.as_ref().is_some_and(|m| m.dirty) {
@@ -631,6 +650,7 @@ impl Bar {
     fn on_tray_event(&mut self, qh: &QueueHandle<Self>, event: TrayEvent) {
         match event {
             TrayEvent::Items(items) => {
+                tracing::debug!(n = items.len(), "tray items updated");
                 self.tray_items = items;
                 self.dirty = true;
             }

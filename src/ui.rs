@@ -247,7 +247,10 @@ impl App for BarApp {
         if self.appearance.border {
             panel = panel.stroke(palette.border.with_alpha(0.6));
         }
-        panel
+        // Overlay root: damascene synthesizes tooltip layers (the tray
+        // icons set them) into the root, which must be Axis::Overlay —
+        // it panics on a plain row.
+        overlays(panel, Vec::<Option<El>>::new())
     }
 
     fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
