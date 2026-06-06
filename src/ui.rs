@@ -142,14 +142,26 @@ impl App for BarApp {
                 Module::Cpu(o) => {
                     if let Some(frac) = self.sys.cpu {
                         right.push(gauge_module(
-                            &ICON_CPU, frac, o.hot, o.width, o.thickness, palette, None,
+                            &ICON_CPU,
+                            frac,
+                            o.hot,
+                            o.width,
+                            o.thickness,
+                            palette,
+                            None,
                         ));
                     }
                 }
                 Module::Memory(o) => {
                     if let Some(frac) = self.sys.mem {
                         right.push(gauge_module(
-                            &ICON_MEM, frac, o.hot, o.width, o.thickness, palette, None,
+                            &ICON_MEM,
+                            frac,
+                            o.hot,
+                            o.width,
+                            o.thickness,
+                            palette,
+                            None,
                         ));
                     }
                 }
@@ -164,7 +176,13 @@ impl App for BarApp {
                         // Label non-root mounts so two disk gauges read.
                         let label = (o.path != "/").then_some(o.path.as_str());
                         right.push(gauge_module(
-                            &ICON_DISK, frac, o.hot, o.width, o.thickness, palette, label,
+                            &ICON_DISK,
+                            frac,
+                            o.hot,
+                            o.width,
+                            o.thickness,
+                            palette,
+                            label,
                         ));
                     }
                 }
@@ -206,12 +224,10 @@ impl App for BarApp {
 // Widest Inter digit advance per text role, mirroring the role recipes
 // in damascene's `apply_text_role` (label = TEXT_SM/Medium, caption =
 // TEXT_XS/Regular). Measured once; used to emulate tabular numerals.
-static DIGIT_W_LABEL: LazyLock<f32> = LazyLock::new(|| {
-    max_digit_width(tokens::TEXT_SM.size, FontWeight::Medium)
-});
-static DIGIT_W_CAPTION: LazyLock<f32> = LazyLock::new(|| {
-    max_digit_width(tokens::TEXT_XS.size, FontWeight::Regular)
-});
+static DIGIT_W_LABEL: LazyLock<f32> =
+    LazyLock::new(|| max_digit_width(tokens::TEXT_SM.size, FontWeight::Medium));
+static DIGIT_W_CAPTION: LazyLock<f32> =
+    LazyLock::new(|| max_digit_width(tokens::TEXT_XS.size, FontWeight::Regular));
 
 fn max_digit_width(size: f32, weight: FontWeight) -> f32 {
     (0..10u8)
@@ -291,9 +307,6 @@ fn middle_truncate(s: &str, max_chars: usize) -> String {
     }
     let keep = max_chars.saturating_sub(1) / 2;
     let head: String = s.chars().take(keep).collect();
-    let tail: String = s
-        .chars()
-        .skip(count - keep)
-        .collect();
+    let tail: String = s.chars().skip(count - keep).collect();
     format!("{head}…{tail}")
 }

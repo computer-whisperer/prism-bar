@@ -155,10 +155,7 @@ fn main() -> Result<()> {
             }
         }
         // System monitor resample.
-        if bar.sysmon.active()
-            && Instant::now() >= bar.sysmon.next_sample
-            && bar.sysmon.sample()
-        {
+        if bar.sysmon.active() && Instant::now() >= bar.sysmon.next_sample && bar.sysmon.sample() {
             for s in &mut bar.surfaces {
                 s.dirty = true;
             }
@@ -379,8 +376,7 @@ impl Bar {
             let Some(name) = self.output_state.info(&output).and_then(|i| i.name) else {
                 continue;
             };
-            if self.config.wants_output(&name)
-                && !self.surfaces.iter().any(|s| s.output == output)
+            if self.config.wants_output(&name) && !self.surfaces.iter().any(|s| s.output == output)
             {
                 self.create_bar(qh, output, name);
             }
@@ -411,8 +407,12 @@ impl Bar {
                 };
                 if let Some(msaa) = sc.msaa.as_mut() {
                     if !msaa.matches(extent) {
-                        *msaa =
-                            MsaaTarget::new(&gpu.device, sc.config.format, extent, msaa.sample_count);
+                        *msaa = MsaaTarget::new(
+                            &gpu.device,
+                            sc.config.format,
+                            extent,
+                            msaa.sample_count,
+                        );
                     }
                 }
             }
@@ -519,7 +519,8 @@ impl Bar {
             .prepare(&gpu.device, &gpu.queue, &mut tree, viewport, scale);
 
         let frame = match s.wgpu_surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 s.wgpu_surface.configure(&gpu.device, &sc.config);
                 s.dirty = true; // try again next loop turn

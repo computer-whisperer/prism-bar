@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use crate::config::Module;
 
-
 /// One render-ready reading. Fractions are `0.0..=1.0`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SysStats {

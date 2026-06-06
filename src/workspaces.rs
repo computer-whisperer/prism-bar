@@ -8,6 +8,7 @@
 //! Missing global → `WorkspacesState::default()` with no manager; the
 //! workspace module simply doesn't render.
 
+use wayland_client::backend::ObjectId;
 use wayland_client::globals::GlobalList;
 use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum};
@@ -20,7 +21,6 @@ use wayland_protocols::ext::workspace::v1::client::ext_workspace_handle_v1::{
 use wayland_protocols::ext::workspace::v1::client::ext_workspace_manager_v1::{
     self, ExtWorkspaceManagerV1,
 };
-use wayland_client::backend::ObjectId;
 
 use crate::Bar;
 
@@ -247,8 +247,7 @@ impl Dispatch<ExtWorkspaceHandleV1, ()> for Bar {
                 }
             }
             ext_workspace_handle_v1::Event::State { state } => {
-                if let (Some(ws), WEnum::Value(state)) =
-                    (bar.workspaces.workspace_mut(&id), state)
+                if let (Some(ws), WEnum::Value(state)) = (bar.workspaces.workspace_mut(&id), state)
                 {
                     ws.state = state;
                 }
