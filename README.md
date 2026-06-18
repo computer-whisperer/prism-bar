@@ -7,6 +7,8 @@ compositor — rendered with the
 speaks layer-shell; the workspace and window-title modules light up when the
 compositor also offers the matching protocols.
 
+![prism-bar on the prism compositor](assets/screenshot.png)
+
 One bar per output (all outputs by default, hotplug included), each with its
 own layer surface, swapchain, and damascene runner. The event loop is
 calloop-driven and redraws only on actual change: protocol events, clock
@@ -24,6 +26,9 @@ Left cluster:
 
 Right cluster, picked and ordered by config:
 
+- **tray** — system tray: a `StatusNotifierItem` host that shows each
+  registered app's icon and opens its `com.canonical.dbusmenu` menu on
+  click (`icon-size` configurable)
 - **cpu** — aggregate load gauge (`/proc/stat`)
 - **memory** — usage gauge (1 − MemAvailable/MemTotal)
 - **disk "/path"** — per-mount usage gauge (statvfs); repeatable, non-root

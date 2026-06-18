@@ -49,6 +49,11 @@ title-max-length 80
 // Right-side modules, in display order. Presence enables a module;
 // omitting the whole block keeps the default set shown here.
 modules {
+    // System tray — a StatusNotifierItem host. Shows each registered
+    // app's icon; clicking opens its com.canonical.dbusmenu menu.
+    // icon-size= is the icon edge in logical pixels.
+    tray icon-size=22
+
     // CPU load gauge (aggregate, from /proc/stat). Gauge options on
     // cpu/memory/disk: hot= is the integer percentage where the fill
     // switches to the destructive accent; width= and thickness= size
