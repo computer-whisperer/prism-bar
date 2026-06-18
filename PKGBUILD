@@ -17,8 +17,7 @@ depends=(
 )
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# TODO: fill in from the release tarball once v0.1.0 is tagged.
-sha256sums=('SKIP')
+sha256sums=('ea7cf9d015754d865cc4b070a2f2149c6258bf1bdedb92f0e3f02624627a93f3')
 
 prepare() {
     cd "$pkgname-$pkgver"
