@@ -221,10 +221,15 @@ fn main() -> Result<()> {
             }
         }
 
+        // Only draw a surface once its previous frame callback has
+        // fired: dirtiness marks *what* to redraw, the callback gates
+        // *when*. This paces each surface to its output's repaint and
+        // makes it stall automatically while the output is DPMS-off
+        // (prism withholds the callback for powered-off outputs).
         for i in 0..bar.surfaces.len() {
-            if bar.surfaces[i].dirty {
+            if bar.surfaces[i].dirty && !bar.surfaces[i].frame_pending {
                 let t = Instant::now();
-                bar.draw(i);
+                bar.draw(i, &qh);
                 let took = t.elapsed();
                 // Steady-state acquire on an idle output stalls ~1s
                 // (prism releases buffers with its repaint cycle); only
@@ -234,8 +239,8 @@ fn main() -> Result<()> {
                 }
             }
         }
-        if bar.menu.as_ref().is_some_and(|m| m.dirty) {
-            bar.draw_menu();
+        if bar.menu.as_ref().is_some_and(|m| m.dirty && !m.frame_pending) {
+            bar.draw_menu(&qh);
         }
     }
     Ok(())
@@ -363,6 +368,10 @@ struct FrameOutcome {
     /// The frame was lost/outdated; the surface was reconfigured and
     /// the caller should redraw next loop turn.
     retry: bool,
+    /// The frame reached `present()` and a `wl_surface.frame` callback
+    /// was requested on the commit — the caller must now wait for that
+    /// callback before drawing this surface again.
+    presented: bool,
     anim_deadline: Option<Instant>,
 }
 
@@ -376,6 +385,8 @@ fn render_frame<A: App>(
     (width, height): (u32, u32),
     scale: i32,
     label: &str,
+    wl_surface: &wl_surface::WlSurface,
+    qh: &QueueHandle<Bar>,
 ) -> FrameOutcome {
     let viewport = Rect::new(0.0, 0.0, width as f32, height as f32);
 
@@ -400,6 +411,7 @@ fn render_frame<A: App>(
             wgpu_surface.configure(&gpu.device, &sc.config);
             return FrameOutcome {
                 retry: true,
+                presented: false,
                 anim_deadline: None,
             };
         }
@@ -407,6 +419,7 @@ fn render_frame<A: App>(
             tracing::error!(surface = %label, "surface unavailable: {other:?}");
             return FrameOutcome {
                 retry: false,
+                presented: false,
                 anim_deadline: None,
             };
         }
@@ -430,6 +443,13 @@ fn render_frame<A: App>(
         wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
     );
     gpu.queue.submit(Some(encoder.finish()));
+    // Request a frame callback on this commit. `present()` issues the
+    // wl_surface commit (via Vulkan WSI on our connection); the frame
+    // request queued here rides that same commit, so the compositor
+    // fires the callback on the next repaint of this surface's output.
+    // The caller gates the next draw on that callback — when the output
+    // is DPMS-off, prism withholds it and this surface stalls for free.
+    wl_surface.frame(qh, wl_surface.clone());
     frame.present();
 
     let mut anim_deadline = prepare.next_redraw_in.map(|d| Instant::now() + d);
@@ -438,6 +458,7 @@ fn render_frame<A: App>(
     }
     FrameOutcome {
         retry: false,
+        presented: true,
         anim_deadline,
     }
 }
@@ -457,6 +478,11 @@ struct BarSurface {
     /// Integer buffer scale from the compositor.
     scale: i32,
     dirty: bool,
+    /// A `wl_surface.frame` callback is outstanding: the last commit
+    /// requested one and it hasn't fired yet. While true the surface is
+    /// not redrawn, so redraw cadence follows the compositor's repaint
+    /// (and stalls entirely when the output is powered off).
+    frame_pending: bool,
     /// When damascene wants the next animation frame.
     anim_deadline: Option<Instant>,
     /// Last pointer position in logical px (button events don't carry one).
@@ -493,6 +519,8 @@ struct MenuSurface {
     height: u32,
     scale: i32,
     dirty: bool,
+    /// See [`BarSurface::frame_pending`].
+    frame_pending: bool,
     anim_deadline: Option<Instant>,
     pointer_pos: (f64, f64),
 }
@@ -629,6 +657,7 @@ impl Bar {
             height: self.config.height,
             scale: 1,
             dirty: false,
+            frame_pending: false,
             anim_deadline: None,
             pointer_pos: (0.0, 0.0),
         });
@@ -755,6 +784,7 @@ impl Bar {
             height: mh as u32,
             scale,
             dirty: false,
+            frame_pending: false,
             anim_deadline: None,
             pointer_pos: (0.0, 0.0),
         });
@@ -799,7 +829,7 @@ impl Bar {
         );
     }
 
-    fn draw_menu(&mut self) {
+    fn draw_menu(&mut self, qh: &QueueHandle<Self>) {
         let Some(gpu) = self.gpu.as_ref() else {
             return;
         };
@@ -818,8 +848,11 @@ impl Bar {
             (m.width, m.height),
             m.scale,
             "menu",
+            m.popup.wl_surface(),
+            qh,
         );
         m.dirty = outcome.retry;
+        m.frame_pending = outcome.presented;
         m.anim_deadline = outcome.anim_deadline;
     }
 
@@ -935,7 +968,7 @@ impl Bar {
         );
     }
 
-    fn draw(&mut self, i: usize) {
+    fn draw(&mut self, i: usize, qh: &QueueHandle<Self>) {
         // Per-output workspace strip and title: each bar describes its
         // own display.
         let ws = self.workspaces.snapshot(Some(&self.surfaces[i].output));
@@ -962,8 +995,11 @@ impl Bar {
             (s.width, s.height),
             s.scale,
             &s.output_name,
+            s.layer.wl_surface(),
+            qh,
         );
         s.dirty = outcome.retry;
+        s.frame_pending = outcome.presented;
         s.anim_deadline = outcome.anim_deadline;
     }
 
@@ -1140,9 +1176,24 @@ impl CompositorHandler for Bar {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
+        // The compositor repainted this surface's output: clear the
+        // gate so the next dirty state can draw. The redraw itself
+        // happens back in the main loop — if the surface is dirty it
+        // draws now, otherwise it waits idle for the next reason.
+        if self
+            .menu
+            .as_ref()
+            .is_some_and(|m| m.popup.wl_surface() == surface)
+        {
+            self.menu.as_mut().expect("checked above").frame_pending = false;
+            return;
+        }
+        if let Some(i) = self.surface_index_for(surface) {
+            self.surfaces[i].frame_pending = false;
+        }
     }
 
     fn surface_enter(
