@@ -239,7 +239,11 @@ fn main() -> Result<()> {
                 }
             }
         }
-        if bar.menu.as_ref().is_some_and(|m| m.dirty && !m.frame_pending) {
+        if bar
+            .menu
+            .as_ref()
+            .is_some_and(|m| m.dirty && !m.frame_pending)
+        {
             bar.draw_menu(&qh);
         }
     }
@@ -368,9 +372,9 @@ struct FrameOutcome {
     /// The frame was lost/outdated; the surface was reconfigured and
     /// the caller should redraw next loop turn.
     retry: bool,
-    /// The frame reached `present()` and a `wl_surface.frame` callback
-    /// was requested on the commit — the caller must now wait for that
-    /// callback before drawing this surface again.
+    /// The frame reached `present()`, committing the `wl_surface.frame`
+    /// request the caller queued beforehand — so the caller must now
+    /// wait for that callback before drawing this surface again.
     presented: bool,
     anim_deadline: Option<Instant>,
 }
@@ -385,8 +389,6 @@ fn render_frame<A: App>(
     (width, height): (u32, u32),
     scale: i32,
     label: &str,
-    wl_surface: &wl_surface::WlSurface,
-    qh: &QueueHandle<Bar>,
 ) -> FrameOutcome {
     let viewport = Rect::new(0.0, 0.0, width as f32, height as f32);
 
@@ -443,13 +445,11 @@ fn render_frame<A: App>(
         wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
     );
     gpu.queue.submit(Some(encoder.finish()));
-    // Request a frame callback on this commit. `present()` issues the
-    // wl_surface commit (via Vulkan WSI on our connection); the frame
-    // request queued here rides that same commit, so the compositor
-    // fires the callback on the next repaint of this surface's output.
-    // The caller gates the next draw on that callback — when the output
-    // is DPMS-off, prism withholds it and this surface stalls for free.
-    wl_surface.frame(qh, wl_surface.clone());
+    // `present()` issues the wl_surface commit (via Vulkan WSI on our
+    // connection). The caller queued a wl_surface.frame request just
+    // before this call; since the acquire above does not commit the
+    // surface, that request is still pending and rides this commit, so
+    // the compositor fires the callback on the next repaint.
     frame.present();
 
     let mut anim_deadline = prepare.next_redraw_in.map(|d| Instant::now() + d);
@@ -840,6 +840,9 @@ impl Bar {
         let Some(sc) = m.swapchain.as_mut() else {
             return; // not configured yet; the configure will redraw
         };
+        // Queue the frame callback ahead of present() (see `draw`).
+        let wl_surface = m.popup.wl_surface();
+        wl_surface.frame(qh, wl_surface.clone());
         let outcome = render_frame(
             gpu,
             &m.wgpu_surface,
@@ -848,8 +851,6 @@ impl Bar {
             (m.width, m.height),
             m.scale,
             "menu",
-            m.popup.wl_surface(),
-            qh,
         );
         m.dirty = outcome.retry;
         m.frame_pending = outcome.presented;
@@ -987,6 +988,11 @@ impl Bar {
             self.sysmon.stats.clone(),
             self.tray_items.clone(),
         );
+        // Queue a frame callback so it rides the commit `render_frame`'s
+        // present() issues; the fired callback is what lets us draw this
+        // surface again (see the main loop's frame_pending gate).
+        let wl_surface = s.layer.wl_surface();
+        wl_surface.frame(qh, wl_surface.clone());
         let outcome = render_frame(
             gpu,
             &s.wgpu_surface,
@@ -995,8 +1001,6 @@ impl Bar {
             (s.width, s.height),
             s.scale,
             &s.output_name,
-            s.layer.wl_surface(),
-            qh,
         );
         s.dirty = outcome.retry;
         s.frame_pending = outcome.presented;
